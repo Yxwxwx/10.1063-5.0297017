@@ -1,0 +1,1268 @@
+[DEBUG] 临时目录已设置为：/home/Yxwxwx/code/dmet/test/large_4/tmp_63815
+#INFO: **** input file is /home/Yxwxwx/code/dmet/test/large_4/dmet_siso.py ****
+from pyscf import gto, scf, ao2mo, mcscf, fci, dmrgscf, lib
+# from pyscf.csf_fci import csf_solver  # TODO:
+from pyscf.mcscf import avas
+from pyscf.tools import molden, fcidump
+from pyscf.lib import logger, cho_solve
+from pyscf.data import nist
+import numpy as np
+import scipy
+from functools import reduce
+import os
+from liblan.utils.rdiis import tag_rdiis_
+import tempfile
+
+dmrgscf.settings.BLOCKEXE = os.popen("which block2main").read().strip()
+dmrgscf.settings.MPIPREFIX = " "
+
+def set_custom_tmpdir(workdir):
+    # 动态获取Slurm分配的作业ID（当在Slurm环境下运行时）
+    slurm_job_id = os.getenv('SLURM_JOB_ID', 'localrun')
+    
+    # 构建唯一临时目录路径
+    custom_tmp = os.path.abspath( 
+        os.path.join(workdir, f"tmp_{slurm_job_id}") 
+    )
+    
+    # 确保目录存在
+    os.makedirs(custom_tmp, exist_ok=True)
+    
+    # 双重配置方案：修改PySCF参数 + 重定向环境变量
+    lib.param.TMPDIR = custom_tmp
+    os.environ['TMPDIR'] = custom_tmp  # 覆盖系统环境变量
+    tempfile.tempdir = custom_tmp      # 影响Python标准库的临时文件
+    
+    print(f"[DEBUG] 临时目录已设置为：{custom_tmp}")
+
+current_workdir = os.path.dirname(os.path.abspath(__file__))
+set_custom_tmpdir(current_workdir)
+
+def read_cas_info(fname):
+    with open(fname, "r") as f1:
+        ncasorb, ncaselec = [int(x) for x in f1.readline().split(" ")]
+        casorbind = [int(x) for x in f1.readline().split(" ")]
+        statelis = [int(x) for x in f1.readline().split(" ")]
+    return ncasorb, ncaselec, casorbind, statelis
+
+
+def rohf_solve_imp(hcore, eris, nelec, spin, max_mem, dm0=None, verbose=logger.INFO):
+    mol = gto.M()
+    mol.verbose = verbose
+    mol.incore_anyway = True
+    mol.nelectron = nelec
+    mol.spin = spin
+
+    nao = hcore.shape[0]
+    print("nao = ", nao)
+    print("nelec = ", mol.nelec)
+
+    mf = scf.rohf.ROHF(mol).x2c()
+    mf.max_memory = max_mem
+    mf.mo_energy = np.zeros((nao))
+    mf.max_cycle = 1000
+    mf.diis_space = 8
+    mf.init_guess = "1e"
+    mf.level_shift = 0.2
+
+    mf.get_hcore = lambda *args: hcore
+    mf.get_ovlp = lambda *args: np.eye(nao)
+    mf._eri = ao2mo.restore(8, eris, nao)
+
+    if dm0 is None:
+        mf.kernel()
+    else:
+        if dm0.shape != hcore.shape:
+            bath_size = hcore.shape[0] - dm0.shape[0]
+            dm0 = scipy.linalg.block_diag(
+                dm0, np.eye(bath_size) * (nelec - np.trace(dm0)) / bath_size
+            )
+        mf.kernel(dm0)
+    return mf
+
+
+def sacasscf_solve_imp(
+    solver_base, mol, ncasorb, ncaselec, casorbind, statelis, avas=False
+):
+    solver = mcscf.CASSCF(solver_base, ncasorb, ncaselec)
+
+    if avas:
+        mo = casorbind
+    else:
+        mo = solver.sort_mo(casorbind)
+    mcfs = []
+    logger.info(solver, "Attempting SA-DMRGSCF with")
+    for i in range(len(statelis)):
+        if statelis[i] != 0:
+            new_mcf = dmrgscf.DMRGCI(mol, maxM=1500, tol=1e-10)
+            new_mcf.spin = i
+            new_mcf.nroots = statelis[i]
+            new_mcf.threads = 16
+            new_mcf.memory = int(mol.max_memory / 1000)
+            new_mcf.block_extra_keyword = [
+                "real_density_matrix",
+                "davidson_soft_max_iter 1600",
+                "noreorder",
+                "cutoff 1E-24",
+            ]
+            new_mcf.runtimeDir = lib.param.TMPDIR + "/%d" % i
+            new_mcf.scratchDirectory = lib.param.TMPDIR + "/%d" % i
+            mcfs.append(new_mcf)
+            logger.info(
+                solver, "%s states with spin multiplicity %s", statelis[i], i + 1
+            )
+
+    statetot = sum(statelis)
+    mcscf.state_average_mix_(solver, mcfs, np.ones(statetot) / statetot)
+    solver.run(mo, verbose=mol.verbose)
+    return solver
+
+
+def lowdin(s):
+    """new basis is |mu> c^{lowdin}_{mu i}"""
+    e, v = scipy.linalg.eigh(s)
+    idx = e > 1e-15
+    return np.dot(v[:, idx] / np.sqrt(e[idx]), v[:, idx].conj().T)
+
+
+def caolo(s):
+    return lowdin(s)
+
+
+def cloao(s):
+    return lowdin(s) @ s
+
+
+def get_dmet_as_props(mf, imp_inds, lo_meth="lowdin", thres=1e-13):
+    """
+    Returns C(AO->AS), entropy loss, and orbital composition
+    """
+    s = mf.get_ovlp()
+    caolo_mat, cloao_mat = caolo(s), cloao(s)
+    env_inds = [x for x in range(s.shape[0]) if x not in imp_inds]
+
+    if mf.mol.spin == 0:
+        pass
+    else:
+        dma, dmb = mf.make_rdm1()
+
+        ldma = reduce(np.dot, (cloao_mat, dma, cloao_mat.conj().T))
+        ldmb = reduce(np.dot, (cloao_mat, dmb, cloao_mat.conj().T))
+
+        ldma_env = ldma[env_inds, :][:, env_inds]
+        ldmb_env = ldmb[env_inds, :][:, env_inds]
+
+        nat_occa, nat_coeffa = np.linalg.eigh(ldma_env)
+        nat_occb, nat_coeffb = np.linalg.eigh(ldmb_env)
+
+        ldmr_env = ldma_env + ldmb_env
+        nat_occr, nat_coeffr = np.linalg.eigh(ldmr_env)
+
+        caoas = np.hstack([caolo_mat[:, imp_inds], caolo_mat[:, env_inds] @ nat_coeffr])
+
+        nuu = np.sum([nat_occr < thres])
+        ne = np.sum([(nat_occr >= thres) & (nat_occr <= 2 - thres)])
+        nuo = np.sum([nat_occr > 2 - thres])
+
+        asorbs = (nuu, ne, nuo)
+        print("caoas.shape = ", caoas.shape)
+        print("asorbs = ", asorbs)
+
+        nat_occa = nat_occa[nat_occa > thres]
+        nat_occb = nat_occb[nat_occb > thres]
+        nat_occr = nat_occr[nat_occr > thres]
+
+        ent = -np.sum(nat_occa * np.log(nat_occa)) - np.sum(nat_occb * np.log(nat_occb))
+        entr = -2 * np.sum(nat_occr / 2 * np.log(nat_occr / 2))
+
+        return caoas, entr - ent, asorbs
+
+
+def get_dmet_imp_ldm(mf, imp_inds, lo_meth="lowdin"):
+    """
+    Returns better initial guess than '1e' for impurity
+    """
+    s = mf.get_ovlp()
+    caolo_mat, cloao_mat = caolo(s), cloao(s)
+
+    dma, dmb = mf.make_rdm1()
+
+    ldm = reduce(np.dot, (cloao_mat, (dma + dmb), cloao_mat.conj().T))[imp_inds, :][
+        :, imp_inds
+    ]
+    return ldm
+
+
+def get_as_1e_ints(mf, caoas, asorbs):
+    # hcore from mf
+    hcore = mf.get_hcore()
+
+    # HF J/K from env UO
+    uos = hcore.shape[0] - asorbs[-1]
+    dm_uo = caoas[:, uos:] @ caoas[:, uos:].conj().T * 2
+    vj, vk = mf.get_jk(dm=dm_uo)
+
+    fock = hcore + vj - 0.5 * vk
+
+    nimp = hcore.shape[0] - np.sum(asorbs)
+    act_inds = [
+        *list(range(nimp)),
+        *list(range(nimp + asorbs[0], nimp + asorbs[0] + asorbs[1])),
+    ]
+
+    asints1e = reduce(np.dot, (caoas[:, act_inds].conj().T, fock, caoas[:, act_inds]))
+    return asints1e
+
+
+def get_as_2e_ints(mf, caoas, asorbs):
+    nimp = caoas.shape[0] - np.sum(asorbs)
+    act_inds = [
+        *list(range(nimp)),
+        *list(range(nimp + asorbs[0], nimp + asorbs[0] + asorbs[1])),
+    ]
+
+    if mf._eri is not None:
+        asints2e = ao2mo.full(mf._eri, caoas[:, act_inds])
+    else:
+        asints2e = ao2mo.full(mf.mol, caoas[:, act_inds])
+
+    return asints2e
+
+
+def get_bp_hso2e(mol, dm0):
+    hso2e = mol.intor("int2e_p1vxp1", 3).reshape(3, mol.nao, mol.nao, mol.nao, mol.nao)
+    vj = np.einsum("yijkl,lk->yij", hso2e, dm0, optimize=True)
+    vk = np.einsum("yijkl,jk->yil", hso2e, dm0, optimize=True)
+    vk += np.einsum("yijkl,li->ykj", hso2e, dm0, optimize=True)
+    return vj, vk
+
+
+def get_bp_hso2e_amfi(mol, dm0):
+    """atomic-mean-field approximation"""
+    ao_loc = mol.ao_loc_nr()
+    nao = ao_loc[-1]
+    vj = np.zeros((3, nao, nao))
+    vk = np.zeros((3, nao, nao))
+    import copy
+
+    atom = copy.copy(mol)
+    aoslice = mol.aoslice_by_atom(ao_loc)
+    for ia in range(mol.natm):
+        b0, b1, p0, p1 = aoslice[ia]
+        atom._bas = mol._bas[b0:b1]
+        vj1, vk1 = get_bp_hso2e(atom, dm0[p0:p1, p0:p1])
+        vj[:, p0:p1, p0:p1] = vj1
+        vk[:, p0:p1, p0:p1] = vk1
+    return vj, vk
+
+
+mol = gto.M(
+    atom="""
+                Co    3.946594   13.913238   30.684257
+                P    3.512134   16.084388   28.030428
+                S    3.288337   17.313925   26.593099
+                N    3.366331   14.435231   27.565538
+                N    3.616930   13.494506   28.544517
+                N    2.390738   16.330189   29.327326
+                N   2.371977   15.382532   30.351455
+                N    4.986512   16.188715   28.690866
+                N    5.265253   15.509610   29.883762
+                C    3.807224   12.252707   28.193902
+                H    3.764341   11.980779   27.304913
+                C    4.072564   11.365834   29.211803
+                N    4.300381   11.867388   30.500917
+                C    4.659528   10.834421   31.288709
+                H    4.900746   10.884186   32.184236
+                N    4.605924    9.690018   30.523337
+                H    4.753335    8.893610   30.811051
+                C    4.276259   10.022195   29.222080
+                H    4.206574    9.442795   28.497498
+                C    3.409215   14.166859   26.176161
+                H    3.263143   14.980862   25.688850
+                H    2.724423   13.532362   25.950410
+                H    4.268219   13.806067   25.947296
+                C    1.468750   15.421632   31.251653
+                H    0.797360   16.063238   31.222072
+                N    2.512688   13.450607   32.199496
+                C    1.510293   14.477886   32.283568
+                C    0.763857   14.216623   33.407027
+                H    0.041543   14.719599   33.709999
+                N    1.271755   13.066888   34.016398
+                H    0.966212   12.693477   34.728214
+                C    2.347855   12.636604   33.272198
+                H    2.881215   11.902579   33.473352
+                C    1.313298   17.310902   29.269097
+                H    1.460709   17.904522   28.528635
+                H    1.295877   17.813879   30.085536
+                H    0.474395   16.857691   29.154509
+                C    6.273008   15.848185   30.627648
+                H    6.868012   16.521781   30.387575
+                N    5.432766   14.205071   32.134415
+                C    6.401658   15.128378   31.815875
+                C    7.243240   15.309663   32.884531
+                H    7.974935   15.881953   32.925321
+                N    6.794307   14.481441   33.882816
+                H    7.138713   14.399685   34.665935
+                C    5.684704   13.802512   33.400487
+                H    5.191547   13.171571   33.871918
+                C    5.971486   17.286020   28.385713
+                H    5.746349   17.694799   27.547789
+                H    6.855952   16.916342   28.332467
+                H    5.942003   17.945398   29.082893
+        """,
+    basis={"default": "def2tzvp", "C": "6-31G*", "H": "6-31G*"},
+    symmetry=0,
+    spin=3,
+    charge=+2,
+    verbose=4,
+    max_memory=200000,
+)
+
+mf = scf.rohf.ROHF(mol).x2c()
+mf.max_cycle = 100
+title = "CoSMM10"
+imp_inds = mol.search_ao_label(["Co *"])
+mf.chkfile = title + "_rohf.chk"
+mf.init_guess = "atom"
+if os.path.isfile(title + "_rohf.chk"):
+    mf.init_guess = "chk"
+mf = tag_rdiis_(mf=mf, imp_inds=imp_inds)
+mf.kernel()
+
+print("nao = ", mol.nao_nr())
+print("nelec = ", mol.nelec)
+
+
+print("imp_inds.shape", imp_inds.shape)
+
+# AS general info
+caoas, ent, asorbs = get_dmet_as_props(mf, imp_inds, thres=1e-13)
+# AS hcore + j/k
+as1e = get_as_1e_ints(mf, caoas, asorbs)
+# AS ERIs
+as2e = get_as_2e_ints(mf, caoas, asorbs)
+
+print(f"Entanglement S: {ent:.3f}")
+
+nimp = caoas.shape[0] - np.sum(asorbs)
+print("nimp = ", nimp)
+act_inds = [
+    *list(range(nimp)),
+    *list(range(nimp + asorbs[0], nimp + asorbs[0] + asorbs[1])),
+]
+
+print("act_inds = ", act_inds)
+
+nelec = int(mf.mol.nelectron - asorbs[-1] * 2)
+ldm = get_dmet_imp_ldm(mf, imp_inds)
+solver_base = rohf_solve_imp(as1e, as2e, nelec, mf.mol.spin, mf.max_memory, dm0=ldm)
+
+with open(title + "_imp_rohf_orbs.molden", "w") as f1:
+    molden.header(mf.mol, f1)
+    molden.orbital_coeff(
+        mf.mol,
+        f1,
+        caoas[:, act_inds] @ solver_base.mo_coeff,
+        ene=solver_base.mo_energy,
+        occ=solver_base.mo_occ,
+    )
+
+# avas
+# ao_labels = ["Co 3d"]
+# ncasorb, ncaselec, casorbind = avas.avas(solver_base, ao_labels, canonicalize=False)
+
+# ncasorb = 5
+# ncaselec = 7
+# casorbind = [40, 41, 55, 56, 57]  # F-style
+
+casinfo_fname = title + "_cas_info"
+
+
+if not os.path.isfile(casinfo_fname):
+    print("Failed to read saved CAS briefings.")
+    exit()
+
+
+ncasorb, ncaselec, casorbind, statelis = read_cas_info(casinfo_fname)
+
+solver = sacasscf_solve_imp(
+    solver_base, mf.mol, ncasorb, ncaselec, casorbind, statelis=statelis
+)
+
+mc = solver.copy()
+fcidump.from_integrals(
+    "FCIDUMP",
+    solver.get_h1eff()[0],
+    solver.get_h2eff(),
+    solver.ncas,
+    solver.nelecas,
+    nuc=solver.get_h1eff()[1],
+)
+"""large cas
+casinfo_fname_large = title + "_cas_info_large"
+
+if not os.path.isfile(casinfo_fname_large):
+    print("Failed to read saved Large CAS briefings.")
+    exit()
+ncasorb_large, ncaselec_large, casorbind_large, statelis_large = read_cas_info(
+    casinfo_fname
+)
+solver.ncas = ncasorb_large
+solver.nelecas = ncaselec_large
+solver.mo_coeff = solver.sort_mo(casorbind_large, solver.mo_coeff)
+fcidump.from_integrals(
+    "FCIDUMP_1",
+    solver.get_h1eff()[0],
+    solver.get_h2eff(),
+    solver.ncas,
+    solver.nelecas,
+    nuc=mc.get_h1eff()[1],
+)
+
+with open("cas.molden", "w") as f1:
+    molden.header(mol, f1)
+    molden.orbital_coeff(
+        mol,
+        f1,
+        caoas[:, act_inds] @ solver.mo_coeff,
+        ene=solver_base.mo_energy,
+        occ=solver_base.mo_occ,
+    )
+"""
+
+uos = caoas.shape[0] - asorbs[-1]
+dm_uo = caoas[:, uos:] @ caoas[:, uos:].conj().T * 2
+mo_cas = caoas[:, act_inds] @ mc.mo_coeff[:, mc.ncore : mc.ncore + mc.ncas]
+print("mo_cas.shape = ", mo_cas.shape)
+sodm1_act = reduce(
+    np.dot, [caoas[:, act_inds], mc.make_rdm1(), caoas[:, act_inds].conj().T]
+)
+sodm1 = sodm1_act + dm_uo
+
+# soc integral
+# breit-pauli amfi
+# amfi = True
+# hso1e = mol.intor_asymmetric("int1e_pnucxp", 3)
+# vj, vk = get_bp_hso2e_amfi(mol, sodm1) if amfi else get_bp_hso2e(mol, sodm1)
+# hso2e = vj - vk * 1.5
+# hsoao = 1.0j * (nist.ALPHA**2 / 2) * (hso1e + hso2e)
+# print("hsoao.shape = ", hsoao.shape)
+
+# hso = np.asarray([reduce(np.dot, (mo_cas.T, x.T, mo_cas)) for x in hsoao])
+# print("hso.shape = ", hso.shape)
+# # Save each component of hso (shape: 3 x nao x nao) to separate binary files as complex128
+# hso[0].astype(np.complex128).tofile("hso_x.bin")
+# hso[1].astype(np.complex128).tofile("hso_y.bin")
+# hso[2].astype(np.complex128).tofile("hso_z.bin")
+
+# x2camf
+from mycamf import x2camf
+
+xmol, ctr = mf.with_x2c.get_xmol(mol)
+xdmao = ctr @ sodm1 @ ctr.conj().T
+print("sodm1.shape = ", sodm1.shape)
+print("xdmao.shape = ", xdmao.shape)
+x = mf.with_x2c.get_xmat()
+r = mf.with_x2c._get_rmat(x=x)
+hso1e = xmol.intor_asymmetric("int1e_pnucxp", 3)
+hso1e = np.einsum(
+    "pq,qr,irs,sk,kl->ipl", r.conj().T, x.conj().T, hso1e, x, r, optimize=True
+)
+
+hso2e = x2camf.amfi(mf.with_x2c, printLevel=1)
+
+hso2e = hso2e / (nist.ALPHA**2 / 4)
+sphsp = xmol.sph2spinor_coeff()
+p_repr = np.einsum("ixp,pq,jyq->ijxy", sphsp, hso2e, sphsp.conj(), optimize=True)
+hso2e = (p_repr[0, np.array([1, 1, 0])] * np.array([-1j, 1, -1j])[:, None, None]).real
+
+s22 = xmol.intor_symmetric("int1e_ovlp")
+s21 = gto.intor_cross("int1e_ovlp", xmol, mol)
+c = cho_solve(s22, s21)
+hso1e = c.conj().T @ hso1e @ c
+hso2e = c.conj().T @ hso2e @ c
+print("hso1e.shape = ", hso1e.shape)
+print("hso2e.shape = ", hso2e.shape)
+hsoao = (1j * nist.ALPHA**2 / 2) * (hso1e + hso2e)
+
+hso = np.asarray([reduce(np.dot, (mo_cas.T.conj(), i.T, mo_cas)) for i in hsoao])
+print("hso.shape = ", hso.shape)
+# Save each component of hso (shape: 3 x nao x nao) to separate binary files as complex128
+hso_labels = ["x", "y", "z"]
+for i, label in enumerate(hso_labels):
+    with open(f"hso_{label}.bin", "wb") as f:
+        # 先写入shape信息（int32），再写入数据（complex128）
+        shape = np.array(hso[i].shape, dtype=np.int32)
+        f.write(shape.tobytes())
+        f.write(hso[i].astype(np.complex128).tobytes())
+        # print(hso[i])
+#INFO: ******************** input file end ********************
+
+
+System: uname_result(system='Linux', node='cu11', release='5.15.0-133-generic', version='#144-Ubuntu SMP Fri Feb 7 20:47:38 UTC 2025', machine='x86_64')  Threads 16
+Python 3.13.2 | packaged by Anaconda, Inc. | (main, Feb  6 2025, 18:56:02) [GCC 11.2.0]
+numpy 2.2.6  scipy 1.15.3  h5py 3.13.0
+Date: Fri Jun 27 14:57:04 2025
+PySCF version 2.9.0
+PySCF path  /home/Yxwxwx/.conda/envs/my_pyscf/lib/python3.13/site-packages/pyscf
+
+[CONFIG] conf_file None
+[INPUT] verbose = 4
+[INPUT] num. atoms = 51
+[INPUT] num. electrons = 251
+[INPUT] charge = 2
+[INPUT] spin (= nelec alpha-beta = 2S) = 3
+[INPUT] symmetry 0 subgroup None
+[INPUT] Mole.unit = angstrom
+[INPUT] Symbol           X                Y                Z      unit          X                Y                Z       unit  Magmom
+[INPUT]  1 Co     3.946594000000  13.913238000000  30.684257000000 AA    7.457981784852  26.292209325891  57.984842065768 Bohr   0.0
+[INPUT]  2 P      3.512134000000  16.084388000000  28.030428000000 AA    6.636971372773  30.395088201241  52.969832074340 Bohr   0.0
+[INPUT]  3 S      3.288337000000  17.313925000000  26.593099000000 AA    6.214056335274  32.718576391260  50.253673913445 Bohr   0.0
+[INPUT]  4 N      3.366331000000  14.435231000000  27.565538000000 AA    6.361443634633  27.278633134831  52.091317296291 Bohr   0.0
+[INPUT]  5 N      3.616930000000  13.494506000000  28.544517000000 AA    6.835007111723  25.500920526300  53.941319487992 Bohr   0.0
+[INPUT]  6 N      2.390738000000  16.330189000000  29.327326000000 AA    4.517840055590  30.859584772385  55.420614105836 Bohr   0.0
+[INPUT]  7 N      2.371977000000  15.382532000000  30.351455000000 AA    4.482386903767  29.068772582358  57.355937432061 Bohr   0.0
+[INPUT]  8 N      4.986512000000  16.188715000000  28.690866000000 AA    9.423141996857  30.592237658638  54.217879016595 Bohr   0.0
+[INPUT]  9 N      5.265253000000  15.509610000000  29.883762000000 AA    9.949886146545  29.308915198816  56.472125751685 Bohr   0.0
+[INPUT] 10 C      3.807224000000  12.252707000000  28.193902000000 AA    7.194610654871  23.154260514541  53.278753162827 Bohr   0.0
+[INPUT] 11 H      3.764341000000  11.980779000000  27.304913000000 AA    7.113573529471  22.640391068940  51.598807425076 Bohr   0.0
+[INPUT] 12 C      4.072564000000  11.365834000000  29.211803000000 AA    7.696030584763  21.478313437270  55.202307274748 Bohr   0.0
+[INPUT] 13 N      4.300381000000  11.867388000000  30.500917000000 AA    8.126542321283  22.426113133950  57.638379678091 Bohr   0.0
+[INPUT] 14 C      4.659528000000  10.834421000000  31.288709000000 AA    8.805231789742  20.474088408236  59.127090801214 Bohr   0.0
+[INPUT] 15 H      4.900746000000  10.884186000000  32.184236000000 AA    9.261067746058  20.568130628825  60.819391568367 Bohr   0.0
+[INPUT] 16 N      4.605924000000   9.690018000000  30.523337000000 AA    8.703934910561  18.311480162106  57.680747337803 Bohr   0.0
+[INPUT] 17 H      4.753335000000   8.893610000000  30.811051000000 AA    8.982501328309  16.806487158693  58.224448000006 Bohr   0.0
+[INPUT] 18 C      4.276259000000  10.022195000000  29.222080000000 AA    8.080958347706  18.939203716985  55.221727990130 Bohr   0.0
+[INPUT] 19 H      4.206574000000   9.442795000000  28.497498000000 AA    7.949272782716  17.844296400412  53.852466455341 Bohr   0.0
+[INPUT] 20 C      3.409215000000  14.166859000000  26.176161000000 AA    6.442482649759  26.771483555330  49.465775282521 Bohr   0.0
+[INPUT] 21 H      3.263143000000  14.980862000000  25.688850000000 AA    6.166446575292  28.309726289904  48.544890955033 Bohr   0.0
+[INPUT] 22 H      2.724423000000  13.532362000000  25.950410000000 AA    5.148413317466  25.572457998472  49.039167720174 Bohr   0.0
+[INPUT] 23 H      4.268219000000  13.806067000000  25.947296000000 AA    8.065764949665  26.089685487396  49.033283113023 Bohr   0.0
+[INPUT] 24 C      1.468750000000  15.421632000000  31.251653000000 AA    2.775535245455  29.142660873829  59.057065109942 Bohr   0.0
+[INPUT] 25 H      0.797360000000  16.063238000000  31.222072000000 AA    1.506792022683  30.355120493706  59.001165121451 Bohr   0.0
+[INPUT] 26 N      2.512688000000  13.450607000000  32.199496000000 AA    4.748292156481  25.417963439158  60.848228789028 Bohr   0.0
+[INPUT] 27 C      1.510293000000  14.477886000000  32.283568000000 AA    2.854040137848  27.359239402675  61.007101843773 Bohr   0.0
+[INPUT] 28 C      0.763857000000  14.216623000000  33.407027000000 AA    1.443480528332  26.865523886193  63.130131665950 Bohr   0.0
+[INPUT] 29 H      0.041543000000  14.719599000000  33.709999000000 AA    0.078504892393  27.816010773422  63.702665769362 Bohr   0.0
+[INPUT] 30 N      1.271755000000  13.066888000000  34.016398000000 AA    2.403268647546  24.692839620366  64.281675964203 Bohr   0.0
+[INPUT] 31 H      0.966212000000  12.693477000000  34.728214000000 AA    1.825876058268  23.987195098466  65.626813255286 Bohr   0.0
+[INPUT] 32 C      2.347855000000  12.636604000000  33.272198000000 AA    4.436802930191  23.879720704583  62.875341782301 Bohr   0.0
+[INPUT] 33 H      2.881215000000  11.902579000000  33.473352000000 AA    5.444707255989  22.492614485999  63.255467751162 Bohr   0.0
+[INPUT] 34 C      1.313298000000  17.310902000000  29.269097000000 AA    2.481773539939  32.712863749186  55.310577243329 Bohr   0.0
+[INPUT] 35 H      1.460709000000  17.904522000000  28.528635000000 AA    2.760339957687  33.834642971250  53.911306857681 Bohr   0.0
+[INPUT] 36 H      1.295877000000  17.813879000000  30.085536000000 AA    2.448852621123  33.663352526141  56.853423350743 Bohr   0.0
+[INPUT] 37 H      0.474395000000  16.857691000000  29.154509000000 AA    0.896476624863  31.856419082545  55.094037306167 Bohr   0.0
+[INPUT] 38 C      6.273008000000  15.848185000000  30.627648000000 AA   11.854267097206  29.948729221440  57.877866559583 Bohr   0.0
+[INPUT] 39 H      6.868012000000  16.521781000000  30.387575000000 AA   12.978661700226  31.221641180043  57.424194339680 Bohr   0.0
+[INPUT] 40 N      5.432766000000  14.205071000000  32.134415000000 AA   10.266439838849  26.843693770002  60.725243523115 Bohr   0.0
+[INPUT] 41 C      6.401658000000  15.128378000000  31.815875000000 AA   12.097380363131  28.588491128895  60.123290163396 Bohr   0.0
+[INPUT] 42 C      7.243240000000  15.309663000000  32.884531000000 AA   13.687739854495  28.931070129387  62.142757324770 Bohr   0.0
+[INPUT] 43 H      7.974935000000  15.881953000000  32.925321000000 AA   15.070443011208  30.012541493214  62.219839253391 Bohr   0.0
+[INPUT] 44 N      6.794307000000  14.481441000000  33.882816000000 AA   12.839379436215  27.365957379048  64.029242569031 Bohr   0.0
+[INPUT] 45 H      7.138713000000  14.399685000000  34.665935000000 AA   13.490212451872  27.211460930008  65.509123001974 Bohr   0.0
+[INPUT] 46 C      5.684704000000  13.802512000000  33.400487000000 AA   10.742533659220  26.082967511023  63.117772857096 Bohr   0.0
+[INPUT] 47 H      5.191547000000  13.171571000000  33.871918000000 AA    9.810601992807  24.890661820264  64.008648333726 Bohr   0.0
+[INPUT] 48 C      5.971486000000  17.286020000000  28.385713000000 AA   11.284473096675  32.665843583754  53.641223420506 Bohr   0.0
+[INPUT] 49 H      5.746349000000  17.694799000000  27.547789000000 AA   10.859025826168  33.438323939228  52.057776547306 Bohr   0.0
+[INPUT] 50 H      6.855952000000  16.916342000000  28.332467000000 AA   12.955871603164  31.967253409477  53.540603063278 Bohr   0.0
+[INPUT] 51 H      5.942003000000  17.945398000000  29.082893000000 AA   11.228758301344  33.911887416318  54.958702680030 Bohr   0.0
+
+nuclear repulsion = 4343.03076438117
+number of shells = 305
+number of NR pGTOs = 1259
+number of NR cGTOs = 743
+basis = {'default': 'def2tzvp', 'C': '6-31G*', 'H': '6-31G*'}
+ecp = {}
+CPU time:         2.44
+
+
+******** <class 'pyscf.x2c.sfx2c1e.sfX2C1eROHF'> ********
+method = sfX2C1eROHF
+initial guess = atom
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'liblan.utils.rdiis.tag_rdiis_.<locals>.RDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 100
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = CoSMM10_rohf.chk
+max_memory 200000 MB (current use 139 MB)
+num. doubly occ = 124  num. singly occ = 3
+
+
+******** <class 'pyscf.x2c.sfx2c1e.SpinFreeX2CHelper'> ********
+approx = 1e
+xuncontract = 1
+Set gradient conv threshold to 3.16228e-05
+Initial guess from the superposition of atomic densities.
+Spherically averaged atomic HF for {'Co', 'P', 'C', 'S', 'H', 'N'}
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /home/Yxwxwx/code/dmet/test/large_4/tmp_63815/tmpro3a13l6
+max_memory 200000 MB (current use 143 MB)
+atom = Co
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -1380.21947107591
+cycle= 1 E= -1376.79397138387  delta_E= 3.43  |g|=    0  |ddm|= 2.32
+cycle= 2 E= -1375.54236136514  delta_E= 1.25  |g|=    0  |ddm|=  3.3
+cycle= 3 E= -1380.49835065845  delta_E= -4.96  |g|=    0  |ddm|= 1.69
+cycle= 4 E= -1380.78758737778  delta_E= -0.289  |g|=    0  |ddm|= 0.445
+cycle= 5 E= -1380.7881962906  delta_E= -0.000609  |g|=    0  |ddm|= 0.0422
+cycle= 6 E= -1380.7883882527  delta_E= -0.000192  |g|=    0  |ddm|= 0.0102
+cycle= 7 E= -1380.78839826533  delta_E= -1e-05  |g|=    0  |ddm|= 0.00306
+cycle= 8 E= -1380.78839827501  delta_E= -9.68e-09  |g|=    0  |ddm|= 0.00021
+cycle= 9 E= -1380.78839827502  delta_E= -7.28e-12  |g|=    0  |ddm|= 7.92e-06
+Extra cycle  E= -1380.78839827502  delta_E= -1.36e-12  |g|=    0  |ddm|= 3.66e-07
+Atomic HF for atom  Co  converged. SCF energy = -1380.78839827502
+
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /home/Yxwxwx/code/dmet/test/large_4/tmp_63815/tmpmqvljt78
+max_memory 200000 MB (current use 160 MB)
+atom = P
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -340.342463808972
+cycle= 1 E= -340.368638063489  delta_E= -0.0262  |g|=    0  |ddm|= 0.313
+cycle= 2 E= -340.369815094546  delta_E= -0.00118  |g|=    0  |ddm|= 0.145
+cycle= 3 E= -340.369910137058  delta_E= -9.5e-05  |g|=    0  |ddm|= 0.0153
+cycle= 4 E= -340.369914579766  delta_E= -4.44e-06  |g|=    0  |ddm|= 0.0112
+cycle= 5 E= -340.36991462355  delta_E= -4.38e-08  |g|=    0  |ddm|= 0.00123
+cycle= 6 E= -340.369914623926  delta_E= -3.76e-10  |g|=    0  |ddm|= 7.43e-05
+Extra cycle  E= -340.369914623926  delta_E= -1.14e-13  |g|=    0  |ddm|= 1.7e-07
+Atomic HF for atom  P  converged. SCF energy = -340.369914623926
+
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /home/Yxwxwx/code/dmet/test/large_4/tmp_63815/tmpy0nf6t1i
+max_memory 200000 MB (current use 161 MB)
+atom = S
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -397.174574897502
+cycle= 1 E= -397.190224366785  delta_E= -0.0156  |g|=    0  |ddm|= 0.167
+cycle= 2 E= -397.190637318035  delta_E= -0.000413  |g|=    0  |ddm|= 0.0722
+cycle= 3 E= -397.190674102112  delta_E= -3.68e-05  |g|=    0  |ddm|= 0.0091
+cycle= 4 E= -397.190674679812  delta_E= -5.78e-07  |g|=    0  |ddm|= 0.0036
+cycle= 5 E= -397.190674687266  delta_E= -7.45e-09  |g|=    0  |ddm|= 0.000482
+cycle= 6 E= -397.190674687288  delta_E= -2.29e-11  |g|=    0  |ddm|= 1.58e-05
+Extra cycle  E= -397.190674687288  delta_E= 4.55e-13  |g|=    0  |ddm|= 3.12e-07
+Atomic HF for atom  S  converged. SCF energy = -397.190674687288
+
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /home/Yxwxwx/code/dmet/test/large_4/tmp_63815/tmp2x5clvyu
+max_memory 200000 MB (current use 162 MB)
+atom = N
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -53.7932097385071
+cycle= 1 E= -53.8385772874268  delta_E= -0.0454  |g|=    0  |ddm|= 0.381
+cycle= 2 E= -53.8461705715235  delta_E= -0.00759  |g|=    0  |ddm|= 0.179
+cycle= 3 E= -53.8480669509283  delta_E= -0.0019  |g|=    0  |ddm|= 0.0537
+cycle= 4 E= -53.8480838806564  delta_E= -1.69e-05  |g|=    0  |ddm|= 0.00859
+cycle= 5 E= -53.8480839045579  delta_E= -2.39e-08  |g|=    0  |ddm|= 0.000331
+cycle= 6 E= -53.8480839046809  delta_E= -1.23e-10  |g|=    0  |ddm|= 3.88e-05
+Extra cycle  E= -53.848083904681  delta_E= -1.42e-13  |g|=    0  |ddm|= 1.24e-06
+Atomic HF for atom  N  converged. SCF energy = -53.848083904681
+
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /home/Yxwxwx/code/dmet/test/large_4/tmp_63815/tmphho0_3re
+max_memory 200000 MB (current use 163 MB)
+atom = C
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -37.2760277011609
+cycle= 1 E= -37.3124925813144  delta_E= -0.0365  |g|=    0  |ddm|= 0.352
+cycle= 2 E= -37.3151528640331  delta_E= -0.00266  |g|=    0  |ddm|= 0.13
+cycle= 3 E= -37.3153722895858  delta_E= -0.000219  |g|=    0  |ddm|= 0.0234
+cycle= 4 E= -37.3153754157194  delta_E= -3.13e-06  |g|=    0  |ddm|= 0.00545
+cycle= 5 E= -37.3153754158137  delta_E= -9.42e-11  |g|=    0  |ddm|= 1.35e-05
+Extra cycle  E= -37.3153754158138  delta_E= -1.21e-13  |g|=    0  |ddm|= 1.01e-06
+Atomic HF for atom  C  converged. SCF energy = -37.3153754158138
+
+
+
+******** 1 electron system ********
+Atomic HF for atom  H  converged. SCF energy = -0.49823291072907
+
+init E= -3382.42374042491
+  HOMO = -0.125542713502614  LUMO = -0.0840769529349021
+cycle= 1 E= -3362.36572356379  delta_E= 20.1  |g|= 2.21  |ddm|= 5.43
+----------SDDIS-Entropy 0.317
+  HOMO = -0.493782888336742  LUMO = -0.158433647327526
+cycle= 2 E= -3357.37754841603  delta_E= 4.99  |g|= 6.36  |ddm|= 2.76
+----------SDDIS-Entropy 2.077
+
+WARN: HOMO 0.0342780551912295 >= LUMO -0.189320660107363
+
+cycle= 3 E= -3357.40620719137  delta_E= -0.0287  |g|= 4.69  |ddm|= 47.4
+----------SDDIS-Entropy 1.950
+  HOMO = -0.282910735352266  LUMO = -0.123187520906049
+cycle= 4 E= -3363.42826436485  delta_E= -6.02  |g|= 0.802  |ddm|= 47.4
+----------SDDIS-Entropy 0.047
+  HOMO = -0.253987995920343  LUMO = -0.129070071383841
+cycle= 5 E= -3363.49187259194  delta_E= -0.0636  |g|= 0.611  |ddm|= 0.693
+----------SDDIS-Entropy 0.050
+  HOMO = -0.286549538562818  LUMO = -0.119050488156382
+cycle= 6 E= -3363.5332733835  delta_E= -0.0414  |g|= 0.391  |ddm|= 0.572
+----------SDDIS-Entropy 0.040
+  HOMO = -0.295640632082399  LUMO = -0.118601064059244
+cycle= 7 E= -3363.55918291245  delta_E= -0.0259  |g|= 0.29  |ddm|= 0.35
+----------SDDIS-Entropy 0.026
+  HOMO = -0.297212567029779  LUMO = -0.123158298768217
+cycle= 8 E= -3363.56809707472  delta_E= -0.00891  |g|= 0.212  |ddm|= 0.123
+----------SDDIS-Entropy 0.022
+  HOMO = -0.301096055806221  LUMO = -0.128289581567249
+cycle= 9 E= -3363.57287077531  delta_E= -0.00477  |g|= 0.124  |ddm|= 0.0988
+----------SDDIS-Entropy 0.022
+  HOMO = -0.309535940333732  LUMO = -0.129596719847698
+cycle= 10 E= -3363.57535842052  delta_E= -0.00249  |g|= 0.0512  |ddm|= 0.093
+----------SDDIS-Entropy 0.022
+  HOMO = -0.315921089947572  LUMO = -0.130446045721698
+cycle= 11 E= -3363.57603201165  delta_E= -0.000674  |g|= 0.00986  |ddm|= 0.0576
+----------SDDIS-Entropy 0.021
+  HOMO = -0.317832431169649  LUMO = -0.129665116278992
+cycle= 12 E= -3363.57609179963  delta_E= -5.98e-05  |g|= 0.00444  |ddm|= 0.021
+----------SDDIS-Entropy 0.021
+  HOMO = -0.317878996290508  LUMO = -0.129708620420162
+cycle= 13 E= -3363.57611130093  delta_E= -1.95e-05  |g|= 0.00238  |ddm|= 0.0131
+----------SDDIS-Entropy 0.021
+  HOMO = -0.317703698097046  LUMO = -0.12987597724991
+cycle= 14 E= -3363.57611702595  delta_E= -5.73e-06  |g|= 0.00167  |ddm|= 0.00576
+----------SDDIS-Entropy 0.021
+  HOMO = -0.317596767829986  LUMO = -0.129934559740208
+cycle= 15 E= -3363.57611991401  delta_E= -2.89e-06  |g|= 0.00117  |ddm|= 0.00324
+----------SDDIS-Entropy 0.021
+  HOMO = -0.317603432010401  LUMO = -0.129945525050507
+cycle= 16 E= -3363.57612211792  delta_E= -2.2e-06  |g|= 0.000796  |ddm|= 0.00257
+----------SDDIS-Entropy 0.021
+  HOMO = -0.317690215269457  LUMO = -0.129952183490607
+cycle= 17 E= -3363.57612415577  delta_E= -2.04e-06  |g|= 0.000525  |ddm|= 0.00235
+----------SDDIS-Entropy 0.021
+  HOMO = -0.317764351225673  LUMO = -0.129954500506734
+cycle= 18 E= -3363.57612530031  delta_E= -1.14e-06  |g|= 0.000445  |ddm|= 0.00199
+----------SDDIS-Entropy 0.021
+  HOMO = -0.317815043165267  LUMO = -0.129951619189083
+cycle= 19 E= -3363.5761260471  delta_E= -7.47e-07  |g|= 0.00032  |ddm|= 0.00175
+----------SDDIS-Entropy 0.021
+  HOMO = -0.317811153008033  LUMO = -0.129948996191514
+cycle= 20 E= -3363.57612640466  delta_E= -3.58e-07  |g|= 0.000225  |ddm|= 0.00116
+----------SDDIS-Entropy 0.021
+  HOMO = -0.317854627785314  LUMO = -0.129950657752829
+cycle= 21 E= -3363.57612656135  delta_E= -1.57e-07  |g|= 0.000194  |ddm|= 0.000709
+----------SDDIS-Entropy 0.021
+  HOMO = -0.317857891630526  LUMO = -0.129950976752987
+cycle= 22 E= -3363.57612667154  delta_E= -1.1e-07  |g|= 0.000151  |ddm|= 0.000562
+----------SDDIS-Entropy 0.021
+  HOMO = -0.317848794892321  LUMO = -0.129949539221017
+cycle= 23 E= -3363.57612676501  delta_E= -9.35e-08  |g|= 0.000123  |ddm|= 0.000488
+----------SDDIS-Entropy 0.021
+  HOMO = -0.317853093095994  LUMO = -0.129949163846216
+cycle= 24 E= -3363.57612684277  delta_E= -7.78e-08  |g|= 0.0001  |ddm|= 0.000474
+----------SDDIS-Entropy 0.021
+  HOMO = -0.317860996124297  LUMO = -0.129950853247757
+cycle= 25 E= -3363.57612689673  delta_E= -5.4e-08  |g|= 8.84e-05  |ddm|= 0.000395
+----------SDDIS-Entropy 0.021
+  HOMO = -0.317848548269502  LUMO = -0.129950365542984
+cycle= 26 E= -3363.5761269528  delta_E= -5.61e-08  |g|= 6.94e-05  |ddm|= 0.000486
+----------SDDIS-Entropy 0.021
+  HOMO = -0.317849900852606  LUMO = -0.129949360717531
+cycle= 27 E= -3363.57612699052  delta_E= -3.77e-08  |g|= 5.7e-05  |ddm|= 0.000462
+----------SDDIS-Entropy 0.021
+  HOMO = -0.317848765608649  LUMO = -0.129950379163828
+cycle= 28 E= -3363.57612700738  delta_E= -1.69e-08  |g|= 4.44e-05  |ddm|= 0.000298
+----------SDDIS-Entropy 0.021
+  HOMO = -0.317847815056933  LUMO = -0.129950737964802
+cycle= 29 E= -3363.57612701478  delta_E= -7.4e-09  |g|= 3.62e-05  |ddm|= 0.000166
+----------SDDIS-Entropy 0.021
+  HOMO = -0.317848460839506  LUMO = -0.129950193459231
+cycle= 30 E= -3363.5761270206  delta_E= -5.82e-09  |g|= 2.92e-05  |ddm|= 0.000154
+----------SDDIS-Entropy 0.021
+  HOMO = -0.317848593004188  LUMO = -0.129950252902359
+cycle= 31 E= -3363.57612702387  delta_E= -3.27e-09  |g|= 2.57e-05  |ddm|= 0.000109
+----------SDDIS-Entropy 0.021
+  HOMO = -0.317849800387954  LUMO = -0.129950581455744
+cycle= 32 E= -3363.5761270266  delta_E= -2.73e-09  |g|= 2.01e-05  |ddm|= 9.87e-05
+----------SDDIS-Entropy 0.021
+  HOMO = -0.317851601455621  LUMO = -0.129950466037478
+cycle= 33 E= -3363.57612702856  delta_E= -1.96e-09  |g|= 1.51e-05  |ddm|= 9.17e-05
+----------SDDIS-Entropy 0.021
+  HOMO = -0.317850976340537  LUMO = -0.129950214836557
+cycle= 34 E= -3363.5761270291  delta_E= -5.38e-10  |g|= 1.26e-05  |ddm|= 4.7e-05
+  HOMO = -0.317853153827031  LUMO = -0.129950431247658
+Extra cycle  E= -3363.57612702923  delta_E= -1.29e-10  |g|= 1.61e-05  |ddm|= 4.54e-05
+converged SCF energy = -3363.57612702923
+nao =  743
+nelec =  (127, 124)
+imp_inds.shape (45,)
+caoas.shape =  (743, 743)
+asorbs =  (np.int64(571), np.int64(56), np.int64(71))
+Entanglement S: 0.021
+nimp =  45
+act_inds =  [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 616, 617, 618, 619, 620, 621, 622, 623, 624, 625, 626, 627, 628, 629, 630, 631, 632, 633, 634, 635, 636, 637, 638, 639, 640, 641, 642, 643, 644, 645, 646, 647, 648, 649, 650, 651, 652, 653, 654, 655, 656, 657, 658, 659, 660, 661, 662, 663, 664, 665, 666, 667, 668, 669, 670, 671]
+nao =  101
+nelec =  (56, 53)
+
+
+******** <class 'pyscf.x2c.sfx2c1e.sfX2C1eROHF'> ********
+method = sfX2C1eROHF
+initial guess = 1e
+damping factor = 0
+level_shift factor = 0.2
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 1000
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /home/Yxwxwx/code/dmet/test/large_4/tmp_63815/tmpwd_wq1c6
+max_memory 200000 MB (current use 902 MB)
+num. doubly occ = 53  num. singly occ = 3
+
+
+******** <class 'pyscf.x2c.sfx2c1e.SpinFreeX2CHelper'> ********
+approx = 1e
+xuncontract = 1
+Set gradient conv threshold to 3.16228e-05
+init E= -2558.64858577272
+  HOMO = 1.02540551023754  LUMO = 1.06064721242762
+cycle= 1 E= -2667.31776178497  delta_E= -109  |g|= 4.15  |ddm|= 10.4
+
+WARN: HOMO -0.597710144520508 >= LUMO -0.729479677507903
+
+cycle= 2 E= -2659.69216809921  delta_E= 7.63  |g|= 9.96  |ddm|= 4.13
+  HOMO = -0.447949162490131  LUMO = -0.113352721364774
+cycle= 3 E= -2667.80762469663  delta_E= -8.12  |g|= 5.63  |ddm|= 1.68
+
+WARN: HOMO 0.2292875469031 >= LUMO -0.518047682541632
+
+cycle= 4 E= -2672.12733447665  delta_E= -4.32  |g|= 1.18  |ddm|= 2.29
+  HOMO = 0.115106251411234  LUMO = 0.144633622489059
+cycle= 5 E= -2672.541444509  delta_E= -0.414  |g|= 0.282  |ddm|= 0.881
+
+WARN: HOMO 0.173384403335027 >= LUMO 0.120092655834304
+
+cycle= 6 E= -2673.00122431089  delta_E= -0.46  |g|= 0.402  |ddm|= 1.53
+  HOMO = 0.0207251188062574  LUMO = 0.238939072579082
+cycle= 7 E= -2673.13547481522  delta_E= -0.134  |g|= 0.322  |ddm|= 0.45
+  HOMO = -0.00374018980573373  LUMO = 0.22750744021232
+cycle= 8 E= -2673.20734077109  delta_E= -0.0719  |g|= 0.239  |ddm|= 0.269
+  HOMO = -0.106385599717044  LUMO = 0.251944380925736
+cycle= 9 E= -2673.25369221211  delta_E= -0.0464  |g|= 0.139  |ddm|= 0.275
+  HOMO = -0.14024859045897  LUMO = 0.263138729060239
+cycle= 10 E= -2673.25297111847  delta_E= 0.000721  |g|= 0.126  |ddm|= 0.0976
+  HOMO = -0.221308029625884  LUMO = 0.276613636989066
+cycle= 11 E= -2673.26573110079  delta_E= -0.0128  |g|= 0.0658  |ddm|= 0.203
+  HOMO = -0.200620158845887  LUMO = 0.271092608628601
+cycle= 12 E= -2673.26621939688  delta_E= -0.000488  |g|= 0.0398  |ddm|= 0.0265
+  HOMO = -0.200907892838829  LUMO = 0.2740752990319
+cycle= 13 E= -2673.2667020789  delta_E= -0.000483  |g|= 0.015  |ddm|= 0.03
+  HOMO = -0.215811966534881  LUMO = 0.277844536299135
+cycle= 14 E= -2673.26688639201  delta_E= -0.000184  |g|= 0.00446  |ddm|= 0.0213
+  HOMO = -0.21603860595464  LUMO = 0.278096336608495
+cycle= 15 E= -2673.26692728098  delta_E= -4.09e-05  |g|= 0.00383  |ddm|= 0.0118
+  HOMO = -0.217115156300291  LUMO = 0.278010251515196
+cycle= 16 E= -2673.2669652341  delta_E= -3.8e-05  |g|= 0.00251  |ddm|= 0.0105
+  HOMO = -0.217428002072768  LUMO = 0.278034462854949
+cycle= 17 E= -2673.26700619551  delta_E= -4.1e-05  |g|= 0.00171  |ddm|= 0.0156
+  HOMO = -0.217699184233225  LUMO = 0.2780279693893
+cycle= 18 E= -2673.26703243804  delta_E= -2.62e-05  |g|= 0.00107  |ddm|= 0.015
+  HOMO = -0.217741175711229  LUMO = 0.278027890140668
+cycle= 19 E= -2673.26704163401  delta_E= -9.2e-06  |g|= 0.000796  |ddm|= 0.00799
+  HOMO = -0.21776768965582  LUMO = 0.278029236946808
+cycle= 20 E= -2673.2670477433  delta_E= -6.11e-06  |g|= 0.000637  |ddm|= 0.00779
+  HOMO = -0.217787973855172  LUMO = 0.278027424867555
+cycle= 21 E= -2673.26705121315  delta_E= -3.47e-06  |g|= 0.000508  |ddm|= 0.00536
+  HOMO = -0.217735467907535  LUMO = 0.278029352535558
+cycle= 22 E= -2673.2670539025  delta_E= -2.69e-06  |g|= 0.000397  |ddm|= 0.005
+  HOMO = -0.217749285923811  LUMO = 0.278029213447548
+cycle= 23 E= -2673.26705599039  delta_E= -2.09e-06  |g|= 0.000282  |ddm|= 0.00502
+  HOMO = -0.217744474845715  LUMO = 0.278029539952267
+cycle= 24 E= -2673.26705688903  delta_E= -8.99e-07  |g|= 0.000215  |ddm|= 0.00298
+  HOMO = -0.217738414448475  LUMO = 0.278030307880574
+cycle= 25 E= -2673.26705762805  delta_E= -7.39e-07  |g|= 0.000174  |ddm|= 0.00356
+  HOMO = -0.217753257579098  LUMO = 0.278030651370561
+cycle= 26 E= -2673.26705794695  delta_E= -3.19e-07  |g|= 0.00012  |ddm|= 0.00227
+  HOMO = -0.217758486050641  LUMO = 0.278030611027559
+cycle= 27 E= -2673.26705811609  delta_E= -1.69e-07  |g|= 8.35e-05  |ddm|= 0.00176
+  HOMO = -0.217759042041802  LUMO = 0.27803076392701
+cycle= 28 E= -2673.26705816603  delta_E= -4.99e-08  |g|= 5.96e-05  |ddm|= 0.000749
+  HOMO = -0.217758803363968  LUMO = 0.278030785804082
+cycle= 29 E= -2673.2670581962  delta_E= -3.02e-08  |g|= 5.32e-05  |ddm|= 0.000576
+  HOMO = -0.217760171893416  LUMO = 0.278030796950319
+cycle= 30 E= -2673.2670582123  delta_E= -1.61e-08  |g|= 5.11e-05  |ddm|= 0.000284
+  HOMO = -0.217762138020479  LUMO = 0.278030797981748
+cycle= 31 E= -2673.26705822378  delta_E= -1.15e-08  |g|= 5.09e-05  |ddm|= 0.000181
+  HOMO = -0.217761406433797  LUMO = 0.278030847673624
+cycle= 32 E= -2673.26705823365  delta_E= -9.87e-09  |g|= 5.08e-05  |ddm|= 0.000152
+  HOMO = -0.217763070990771  LUMO = 0.278030864230851
+cycle= 33 E= -2673.26705825199  delta_E= -1.83e-08  |g|= 4.84e-05  |ddm|= 0.000285
+  HOMO = -0.217765881796411  LUMO = 0.278031014560458
+cycle= 34 E= -2673.26705832501  delta_E= -7.3e-08  |g|= 4.75e-05  |ddm|= 0.00119
+  HOMO = -0.217765776627904  LUMO = 0.278031000641578
+cycle= 35 E= -2673.26705833063  delta_E= -5.62e-09  |g|= 4.78e-05  |ddm|= 9.73e-05
+  HOMO = -0.217766895808266  LUMO = 0.278031080129373
+cycle= 36 E= -2673.26705836135  delta_E= -3.07e-08  |g|= 4.36e-05  |ddm|= 0.000516
+  HOMO = -0.217767578302253  LUMO = 0.278031126194456
+cycle= 37 E= -2673.26705839317  delta_E= -3.18e-08  |g|= 4.29e-05  |ddm|= 0.000537
+  HOMO = -0.217769969446577  LUMO = 0.27803127971289
+cycle= 38 E= -2673.26705845949  delta_E= -6.63e-08  |g|= 4.55e-05  |ddm|= 0.00114
+  HOMO = -0.217770636538763  LUMO = 0.278031354157319
+cycle= 39 E= -2673.26705850099  delta_E= -4.15e-08  |g|= 4.16e-05  |ddm|= 0.000724
+  HOMO = -0.217772875365709  LUMO = 0.278031549923147
+cycle= 40 E= -2673.26705857919  delta_E= -7.82e-08  |g|= 4.92e-05  |ddm|= 0.0014
+  HOMO = -0.217775687222757  LUMO = 0.278031656301551
+cycle= 41 E= -2673.26705863834  delta_E= -5.91e-08  |g|= 4.4e-05  |ddm|= 0.00107
+  HOMO = -0.217776530963402  LUMO = 0.278031882853744
+cycle= 42 E= -2673.26705871922  delta_E= -8.09e-08  |g|= 5.1e-05  |ddm|= 0.00151
+  HOMO = -0.217784871792  LUMO = 0.278032377383806
+cycle= 43 E= -2673.26705890848  delta_E= -1.89e-07  |g|= 0.000123  |ddm|= 0.00382
+  HOMO = -0.217783914268197  LUMO = 0.278032310610002
+cycle= 44 E= -2673.26705892888  delta_E= -2.04e-08  |g|= 3.69e-05  |ddm|= 0.000342
+  HOMO = -0.217803854843937  LUMO = 0.278033636342556
+cycle= 45 E= -2673.26705931607  delta_E= -3.87e-07  |g|= 0.000336  |ddm|= 0.00989
+  HOMO = -0.217800913812391  LUMO = 0.278033404760097
+cycle= 46 E= -2673.2670593522  delta_E= -3.61e-08  |g|= 3.67e-05  |ddm|= 0.000301
+  HOMO = -0.217799842493058  LUMO = 0.278033333969449
+cycle= 47 E= -2673.26705933379  delta_E= 1.84e-08  |g|= 4.61e-05  |ddm|= 0.00051
+  HOMO = -0.217807390052257  LUMO = 0.278033912192966
+cycle= 48 E= -2673.26705947075  delta_E= -1.37e-07  |g|= 0.000132  |ddm|= 0.00405
+  HOMO = -0.217817721513752  LUMO = 0.278034463149225
+cycle= 49 E= -2673.26705960244  delta_E= -1.32e-07  |g|= 0.00016  |ddm|= 0.0045
+  HOMO = -0.217829454928803  LUMO = 0.278035577093468
+cycle= 50 E= -2673.26705977312  delta_E= -1.71e-07  |g|= 0.000319  |ddm|= 0.00872
+  HOMO = -0.217831655494349  LUMO = 0.27803553586728
+cycle= 51 E= -2673.26705983026  delta_E= -5.71e-08  |g|= 8.57e-05  |ddm|= 0.0016
+  HOMO = -0.217837700171224  LUMO = 0.278035927138075
+cycle= 52 E= -2673.26705987053  delta_E= -4.03e-08  |g|= 0.000103  |ddm|= 0.00273
+  HOMO = -0.217845787557117  LUMO = 0.278036214459072
+cycle= 53 E= -2673.2670599  delta_E= -2.95e-08  |g|= 8.79e-05  |ddm|= 0.00235
+  HOMO = -0.21785144938896  LUMO = 0.278036670579102
+cycle= 54 E= -2673.26705992586  delta_E= -2.59e-08  |g|= 0.000118  |ddm|= 0.00321
+  HOMO = -0.217852630078902  LUMO = 0.278036713610023
+cycle= 55 E= -2673.26705993617  delta_E= -1.03e-08  |g|= 3.87e-05  |ddm|= 0.00087
+  HOMO = -0.217854458944641  LUMO = 0.278036992764602
+cycle= 56 E= -2673.26705994433  delta_E= -8.16e-09  |g|= 6.8e-05  |ddm|= 0.00187
+  HOMO = -0.21785487495621  LUMO = 0.278036964708062
+cycle= 57 E= -2673.26705994692  delta_E= -2.59e-09  |g|= 1.25e-05  |ddm|= 0.000197
+  HOMO = -0.217855517558227  LUMO = 0.278037041623153
+cycle= 58 E= -2673.26705994867  delta_E= -1.75e-09  |g|= 2.17e-05  |ddm|= 0.000601
+  HOMO = -0.217855627214674  LUMO = 0.278037092535287
+cycle= 59 E= -2673.26705994975  delta_E= -1.08e-09  |g|= 1.46e-05  |ddm|= 0.000369
+  HOMO = -0.217855661356007  LUMO = 0.278037083246604
+cycle= 60 E= -2673.26705994995  delta_E= -2.01e-10  |g|= 4.52e-06  |ddm|= 3.14e-05
+  HOMO = -0.317855720603085  LUMO = 0.0780370767350001
+Extra cycle  E= -2673.26705995002  delta_E= -6.59e-11  |g|= 4.73e-06  |ddm|= 1.42e-05
+converged SCF energy = -2673.26705995002
+Attempting SA-DMRGSCF with
+40 states with spin multiplicity 2
+10 states with spin multiplicity 4
+
+******** <class 'pyscf.mcscf.addons.StateAverageCASSCF'> ********
+CAS (5e+2e, 5o), ncore = 51, nvir = 45
+max_cycle_macro = 50
+max_cycle_micro = 4
+conv_tol = 1e-07
+conv_tol_grad = None
+orbital rotation max_stepsize = 0.02
+orbital rotation threshold for CI restart = 0.01
+augmented hessian ah_max_cycle = 30
+augmented hessian ah_conv_tol = 1e-12
+augmented hessian ah_linear dependence = 1e-14
+augmented hessian ah_level shift = 1e-08
+augmented hessian ah_start_tol = 2.5
+augmented hessian ah_start_cycle = 3
+augmented hessian ah_grad_trust_region = 3
+kf_trust_region = 3
+kf_interval = 4
+ci_response_space = 4
+ci_grad_trust_region = 3
+with_dep4 0
+natorb = False
+canonicalization = True
+sorting_mo_energy = False
+ao2mo_level = 2
+chkfile = /home/Yxwxwx/code/dmet/test/large_4/tmp_63815/tmpwd_wq1c6
+max_memory 200000 MB (current use 902 MB)
+internal_rotation = False
+
+******** Block flags ********
+executable             = /home/Yxwxwx/.conda/envs/my_pyscf/bin/block2main
+BLOCKEXE_COMPRESS_NEVPT= /path/to/serially/compiled/Block/block.spin_adapted
+Block version          = 2.0
+mpiprefix              =  
+scratchDirectory       = /home/Yxwxwx/code/dmet/test/large_4/tmp_63815/1
+integralFile           = /home/Yxwxwx/code/dmet/test/large_4/tmp_63815/1/FCIDUMP
+configFile             = /home/Yxwxwx/code/dmet/test/large_4/tmp_63815/1/dmrg.conf
+outputFile             = /home/Yxwxwx/code/dmet/test/large_4/tmp_63815/1/dmrg.out
+maxIter                = 38
+scheduleSweeps         = [0, 4, 8, 12, 14, 16, 18, 20, 22, 24, 26]
+scheduleMaxMs          = [200, 400, 800, 1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500]
+scheduleTols           = [0.0001, 0.0001, 0.0001, 0.0001, 1e-05, 1.0000000000000002e-06, 1.0000000000000002e-07, 1.0000000000000002e-08, 1.0000000000000003e-09, 1.0000000000000003e-10, 1.0000000000000001e-11]
+scheduleNoises         = [0.0001, 0.0001, 0.0001, 0.0001, 1e-05, 1.0000000000000002e-06, 1.0000000000000002e-07, 1.0000000000000002e-08, 1.0000000000000003e-09, 1.0000000000000003e-10, 0.0]
+twodot_to_onedot       = 30
+tol                    = 1e-10
+maxM                   = 1500
+dmrg switch tol        = 0.001
+wfnsym                 = 1
+fullrestart            = False
+num_thrds              = 16
+memory                 = 200
+
+State-average over 50 states with weights [0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02
+ 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02
+ 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02
+ 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02]
+CASCI E = -2672.75119783704  S^2 = 1.3500000
+Set conv_tol_grad to 0.000316228
+macro iter   1 ( 21 JK    4 micro), CASSCF E = -2673.02637574493  dE = -2.75177908e-01  S^2 = 1.3500000
+               |grad[o]|=0.732  |ddm|=1.82e-15  |maxRot[o]|=0.312
+macro iter   2 ( 18 JK    4 micro), CASSCF E = -2673.11722675663  dE = -9.08510117e-02  S^2 = 1.3500000
+               |grad[o]|=0.434  |ddm|=3.37e-15  |maxRot[o]|=0.238
+macro iter   3 ( 10 JK    4 micro), CASSCF E = -2673.11853362043  dE = -1.30686380e-03  S^2 = 1.3500000
+               |grad[o]|=0.0249  |ddm|=3.57e-15  |maxRot[o]|=0.0349
+macro iter   4 (  5 JK    2 micro), CASSCF E = -2673.11853380932  dE = -1.88886133e-07  S^2 = 1.3500000
+               |grad[o]|=0.000322  |ddm|=2.63e-15  |maxRot[o]|=0.000269
+macro iter   5 (  1 JK    1 micro), CASSCF E = -2673.11853380932  dE =  1.36424205e-12  S^2 = 1.3500000
+               |grad[o]|=8.16e-06  |ddm|=2.86e-15  |maxRot[o]|=    0
+1-step CASSCF converged in   5 macro ( 55 JK  15 micro) steps
+CASSCF canonicalization
+Density matrix diagonal elements [1.4 1.4 1.4 1.4 1.4]
+CASSCF energy = -2673.11853380932
+CASCI E = -2673.11853380932  E(CI) = -23.6347478481875  S^2 = 1.3500000
+CASCI state-averaged energy = -2673.11853380932
+CASCI energy for each state
+  State 0 weight 0.02  E = -2673.18483660819 S^2 = 0.7500000
+  State 1 weight 0.02  E = -2673.18343638727 S^2 = 0.7500000
+  State 2 weight 0.02  E = -2673.17111940642 S^2 = 0.7500000
+  State 3 weight 0.02  E = -2673.17064586555 S^2 = 0.7500000
+  State 4 weight 0.02  E = -2673.17008033815 S^2 = 0.7500000
+  State 5 weight 0.02  E = -2673.16777113442 S^2 = 0.7500000
+  State 6 weight 0.02  E = -2673.16713244772 S^2 = 0.7500000
+  State 7 weight 0.02  E = -2673.15846494206 S^2 = 0.7500000
+  State 8 weight 0.02  E = -2673.1491944921 S^2 = 0.7500000
+  State 9 weight 0.02  E = -2673.1450341017 S^2 = 0.7500000
+  State 10 weight 0.02  E = -2673.1440914284 S^2 = 0.7500000
+  State 11 weight 0.02  E = -2673.14302433455 S^2 = 0.7500000
+  State 12 weight 0.02  E = -2673.13455351087 S^2 = 0.7500000
+  State 13 weight 0.02  E = -2673.13429990059 S^2 = 0.7500000
+  State 14 weight 0.02  E = -2673.12912454149 S^2 = 0.7500000
+  State 15 weight 0.02  E = -2673.12570620051 S^2 = 0.7500000
+  State 16 weight 0.02  E = -2673.1252177192 S^2 = 0.7500000
+  State 17 weight 0.02  E = -2673.12311717053 S^2 = 0.7500000
+  State 18 weight 0.02  E = -2673.12134120064 S^2 = 0.7500000
+  State 19 weight 0.02  E = -2673.12065137017 S^2 = 0.7500000
+  State 20 weight 0.02  E = -2673.11473254018 S^2 = 0.7500000
+  State 21 weight 0.02  E = -2673.1142961212 S^2 = 0.7500000
+  State 22 weight 0.02  E = -2673.11344512273 S^2 = 0.7500000
+  State 23 weight 0.02  E = -2673.10364822834 S^2 = 0.7500000
+  State 24 weight 0.02  E = -2673.10032530845 S^2 = 0.7500000
+  State 25 weight 0.02  E = -2673.10015350131 S^2 = 0.7500000
+  State 26 weight 0.02  E = -2673.09711295196 S^2 = 0.7500000
+  State 27 weight 0.02  E = -2673.09640528237 S^2 = 0.7500000
+  State 28 weight 0.02  E = -2673.05178318194 S^2 = 0.7500000
+  State 29 weight 0.02  E = -2673.05162248562 S^2 = 0.7500000
+  State 30 weight 0.02  E = -2673.04688292407 S^2 = 0.7500000
+  State 31 weight 0.02  E = -2673.04638803053 S^2 = 0.7500000
+  State 32 weight 0.02  E = -2673.04365657974 S^2 = 0.7500000
+  State 33 weight 0.02  E = -2673.04181110132 S^2 = 0.7500000
+  State 34 weight 0.02  E = -2673.03736415816 S^2 = 0.7500000
+  State 35 weight 0.02  E = -2672.94404019948 S^2 = 0.7500000
+  State 36 weight 0.02  E = -2672.93846571945 S^2 = 0.7500000
+  State 37 weight 0.02  E = -2672.93661635893 S^2 = 0.7500000
+  State 38 weight 0.02  E = -2672.92743432233 S^2 = 0.7500000
+  State 39 weight 0.02  E = -2672.92707336931 S^2 = 0.7500000
+  State 40 weight 0.02  E = -2673.26264324557 S^2 = 3.7500000
+  State 41 weight 0.02  E = -2673.26144106349 S^2 = 3.7500000
+  State 42 weight 0.02  E = -2673.23974592431 S^2 = 3.7500000
+  State 43 weight 0.02  E = -2673.23168384616 S^2 = 3.7500000
+  State 44 weight 0.02  E = -2673.23057583569 S^2 = 3.7500000
+  State 45 weight 0.02  E = -2673.22898588313 S^2 = 3.7500000
+  State 46 weight 0.02  E = -2673.21035249594 S^2 = 3.7500000
+  State 47 weight 0.02  E = -2673.15636470611 S^2 = 3.7500000
+  State 48 weight 0.02  E = -2673.15221289723 S^2 = 3.7500000
+  State 49 weight 0.02  E = -2673.15058398028 S^2 = 3.7500000
+Initializing 4c-HF with Gaunt with gauge for CO atom.
+Maximum memory cost (2e part) in SCF and amfi calculation: 0.0711967 GB.
+1e-integrals time (CPU/WALL): 0.00/0.00 seconds.
+2e-Coulomb-integrals time (CPU/WALL): 0.73/0.39 seconds.
+2e-Gaunt-integrals time (CPU/WALL): 0.27/0.27 seconds.
+2e-gauge-integrals time (CPU/WALL): 1.40/1.40 seconds.
+
+Start Dirac Hartree-Fock iterations...
+with SCF convergence = 1e-09
+
+
+SCF converges after 18 iterations.
+
+Final DHF energy is -1390.51515626882 hartree.
+DHF iterations time (CPU/WALL): 0.14/0.14 seconds.
+2e-SO Coulomb integrals time (CPU/WALL): 0.54/0.54 seconds.
+Initializing 4c-HF with Gaunt with gauge for P atom.
+Maximum memory cost (2e part) in SCF and amfi calculation: 0.0255496501922607 GB.
+1e-integrals time (CPU/WALL): 0.00/0.00 seconds.
+2e-Coulomb-integrals time (CPU/WALL): 0.13/0.13 seconds.
+2e-Gaunt-integrals time (CPU/WALL): 0.09/0.09 seconds.
+2e-gauge-integrals time (CPU/WALL): 0.47/0.47 seconds.
+
+Start Dirac Hartree-Fock iterations...
+with SCF convergence = 1e-09
+
+
+SCF converges after 12 iterations.
+
+Final DHF energy is -341.145039536141 hartree.
+DHF iterations time (CPU/WALL): 0.03/0.03 seconds.
+2e-SO Coulomb integrals time (CPU/WALL): 0.18/0.18 seconds.
+Initializing 4c-HF with Gaunt with gauge for C atom.
+Maximum memory cost (2e part) in SCF and amfi calculation: 0.00321078300476074 GB.
+1e-integrals time (CPU/WALL): 0.00/0.00 seconds.
+2e-Coulomb-integrals time (CPU/WALL): 0.02/0.02 seconds.
+2e-Gaunt-integrals time (CPU/WALL): 0.01/0.01 seconds.
+2e-gauge-integrals time (CPU/WALL): 0.06/0.06 seconds.
+
+Start Dirac Hartree-Fock iterations...
+with SCF convergence = 1e-09
+
+
+SCF converges after 10 iterations.
+
+Final DHF energy is -37.3324964757747 hartree.
+DHF iterations time (CPU/WALL): 0.01/0.01 seconds.
+2e-SO Coulomb integrals time (CPU/WALL): 0.03/0.03 seconds.
+Initializing 4c-HF with Gaunt with gauge for S atom.
+Maximum memory cost (2e part) in SCF and amfi calculation: 0.0255496501922607 GB.
+1e-integrals time (CPU/WALL): 0.00/0.00 seconds.
+2e-Coulomb-integrals time (CPU/WALL): 0.13/0.13 seconds.
+2e-Gaunt-integrals time (CPU/WALL): 0.09/0.09 seconds.
+2e-gauge-integrals time (CPU/WALL): 0.48/0.48 seconds.
+
+Start Dirac Hartree-Fock iterations...
+with SCF convergence = 1e-09
+
+
+SCF converges after 13 iterations.
+
+Final DHF energy is -398.221567213695 hartree.
+DHF iterations time (CPU/WALL): 0.03/0.03 seconds.
+2e-SO Coulomb integrals time (CPU/WALL): 0.18/0.18 seconds.
+Initializing 4c-HF with Gaunt with gauge for H atom.
+Maximum memory cost (2e part) in SCF and amfi calculation: 4.57763671875e-05 GB.
+1e-integrals time (CPU/WALL): 0.00/0.00 seconds.
+2e-Coulomb-integrals time (CPU/WALL): 0.00/0.00 seconds.
+2e-Gaunt-integrals time (CPU/WALL): 0.00/0.00 seconds.
+2e-gauge-integrals time (CPU/WALL): 0.00/0.00 seconds.
+
+Start Dirac Hartree-Fock iterations...
+with SCF convergence = 1e-09
+
+Special treatment for fractional occupation of H atom.
+
+SCF converges after 1 iterations.
+
+Final DHF energy is -0.340081496312782 hartree.
+DHF iterations time (CPU/WALL): 0.00/0.00 seconds.
+2e-SO Coulomb integrals time (CPU/WALL): 0.00/0.00 seconds.
+Initializing 4c-HF with Gaunt with gauge for N atom.
+Maximum memory cost (2e part) in SCF and amfi calculation: 0.00736874341964722 GB.
+1e-integrals time (CPU/WALL): 0.00/0.00 seconds.
+2e-Coulomb-integrals time (CPU/WALL): 0.04/0.04 seconds.
+2e-Gaunt-integrals time (CPU/WALL): 0.03/0.03 seconds.
+2e-gauge-integrals time (CPU/WALL): 0.15/0.15 seconds.
+
+Start Dirac Hartree-Fock iterations...
+with SCF convergence = 1e-09
+
+
+SCF converges after 12 iterations.
+
+Final DHF energy is -53.8754539020806 hartree.
+DHF iterations time (CPU/WALL): 0.01/0.01 seconds.
+2e-SO Coulomb integrals time (CPU/WALL): 0.06/0.06 seconds.
+mo_cas.shape =  (743, 5)
+sodm1.shape =  (743, 743)
+xdmao.shape =  (1259, 1259)
+hso1e.shape =  (3, 743, 743)
+hso2e.shape =  (3, 743, 743)
+hso.shape =  (3, 5, 5)

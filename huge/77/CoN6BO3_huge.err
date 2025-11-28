@@ -1,0 +1,2 @@
+Overwritten attributes  get_fock  of <class 'pyscf.x2c.sfx2c1e.sfX2C1eROHF'>
+Overwritten attributes  get_hcore get_ovlp  of <class 'pyscf.x2c.sfx2c1e.sfX2C1eROHF'>

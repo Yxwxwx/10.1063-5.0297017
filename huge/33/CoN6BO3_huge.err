@@ -1,0 +1,15 @@
+Overwritten attributes  get_fock  of <class 'pyscf.x2c.sfx2c1e.sfX2C1eROHF'>
+Overwritten attributes  get_hcore get_ovlp  of <class 'pyscf.x2c.sfx2c1e.sfX2C1eROHF'>
+Traceback (most recent call last):
+  File "/home/Yxwxwx/code/dmet/test/huge_ci/33/dmet_siso.py", line 451, in <module>
+    mc.mo_coeff = mc.sort_mo(huge_casorbind, solver.mo_coeff)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/Yxwxwx/.conda/envs/pyscf_311/lib/python3.11/site-packages/pyscf/mcscf/casci.py", line 1017, in sort_mo
+    return addons.sort_mo(self, mo_coeff, caslst, base)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/Yxwxwx/.conda/envs/pyscf_311/lib/python3.11/site-packages/pyscf/mcscf/addons.py", line 87, in sort_mo
+    idx = ext_list(nmo, caslst)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/Yxwxwx/.conda/envs/pyscf_311/lib/python3.11/site-packages/pyscf/mcscf/addons.py", line 79, in ext_list
+    raise ValueError('Active space size is incompatible with caslist. '
+ValueError: Active space size is incompatible with caslist. ncas = 22.  caslist []
