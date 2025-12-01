@@ -1,0 +1,526 @@
+#INFO: **** input file is /home/Yxwxwx/code/dmet/test/soc_amfi/77/dmrgscf.py ****
+from pyscf import gto, scf, ao2mo, mcscf, dmrgscf, lib
+from pyscf.mcscf import avas
+from pyscf.tools import molden, fcidump
+from pyscf.lib import logger, cho_solve
+from pyscf.data import nist
+import numpy as np
+from functools import reduce
+import os
+import copy
+from time import time
+
+
+def get_bp_hso2e(mol, dm0):
+    # SOC_2e integrals are anti-symmetric towards exchange (ij|kl) -> (ji|kl)
+    vj, vk, vk2 = scf.jk.get_jk(
+        mol,
+        [dm0, dm0, dm0],
+        ["ijkl,kl->ij", "ijkl,jk->il", "ijkl,li->kj"],
+        intor="int2e_p1vxp1",
+        comp=3,
+    )
+    # hso2e = vj - 1.5 * vk - 1.5 * vk2
+    return vj, vk + vk2
+    # hso2e = mol.intor("int2e_p1vxp1", 3).reshape(3, mol.nao, mol.nao, mol.nao, mol.nao)
+    # vj = np.einsum("yijkl,lk->yij", hso2e, dm0, optimize=True)
+    # vk = np.einsum("yijkl,jk->yil", hso2e, dm0, optimize=True)
+    # vk += np.einsum("yijkl,li->ykj", hso2e, dm0, optimize=True)
+    # return vj, vk
+
+
+def get_bp_hso2e_amfi(mol, dm0):
+    """atomic-mean-field approximation"""
+    ao_loc = mol.ao_loc_nr()
+    nao = ao_loc[-1]
+    vj = np.zeros((3, nao, nao))
+    vk = np.zeros((3, nao, nao))
+    import copy
+
+    atom = copy.copy(mol)
+    aoslice = mol.aoslice_by_atom(ao_loc)
+    for ia in range(mol.natm):
+        b0, b1, p0, p1 = aoslice[ia]
+        atom._bas = mol._bas[b0:b1]
+        vj1, vk1 = get_bp_hso2e(atom, dm0[p0:p1, p0:p1])
+        vj[:, p0:p1, p0:p1] = vj1
+        vk[:, p0:p1, p0:p1] = vk1
+    return vj, vk
+
+
+dmrgscf.settings.BLOCKEXE = os.popen("which block2main").read().strip()
+dmrgscf.settings.MPIPREFIX = " "
+
+start = time()
+
+mol = gto.M(
+    atom="""
+Co      11.04404000       1.04900000       3.34378000 
+S        8.77823000       3.00936000       4.33821000 
+S       11.43622000       3.02151000       0.92730000 
+S       10.91108000      -2.02878000       2.57231000 
+S       13.08635000       0.19519000       5.60771000 
+O       11.83167000      -0.45768000       5.96583000 
+O       12.19019000       3.07283000      -0.30709000 
+O        7.93263000       3.08738000       5.51462000 
+O       10.07860000       2.53858000       0.82177000 
+N       10.12989000      -0.70978000       2.99572000 
+O       13.74529000       0.85669000       6.71938000 
+O       10.27427000      -2.76510000       1.49667000 
+O       10.00204000       3.77701000       4.38210000 
+O       12.27951000      -1.59956000       2.30125000 
+N       12.76369000       1.14747000       4.38064000 
+N        9.20359000       1.51260000       3.96893000 
+N       12.13222000       2.14916000       2.06988000 
+C        6.10275000      -0.60027000       4.18585000 
+H        5.20999000      -0.54352000       4.44081000 
+C       13.46188000       2.40605000       2.47683000 
+C        8.76888000      -0.75790000       3.38109000 
+C        7.81280000       3.62067000       2.98712000 
+H        6.98919000       3.13006000       2.93372000 
+H        8.30293000       3.51372000       2.16919000 
+H        7.62236000       4.55121000       3.12576000 
+C       14.42792000       3.12175000       1.75566000 
+H       14.21536000       3.46576000       0.91816000 
+C       13.81006000       1.85310000       3.73518000 
+C       11.00381000      -3.08882000       3.98356000 
+H       11.42504000      -2.62011000       4.70785000 
+H       11.51861000      -3.86861000       3.76408000 
+H       10.11859000      -3.35226000       4.24328000 
+C       11.35066000       4.67750000       1.54807000 
+H       10.85506000       4.68550000       2.37038000 
+H       10.91096000       5.23861000       0.90353000 
+H       12.23807000       5.00681000       1.70646000 
+C       15.09147000       2.06251000       4.23761000 
+H       15.32372000       1.70571000       5.06450000 
+C       15.70143000       3.32269000       2.28021000 
+H       16.32999000       3.80946000       1.79791000 
+C        6.91566000       0.52770000       4.27382000 
+H        6.56140000       1.32684000       4.59079000 
+C       14.17866000      -1.05460000       5.00085000 
+H       13.76692000      -1.50748000       4.26157000 
+H       14.36363000      -1.68492000       5.70099000 
+H       14.99923000      -0.64903000       4.70968000 
+C        8.26027000       0.46871000       3.88809000 
+C        7.93481000      -1.87020000       3.30665000 
+H        8.26769000      -2.67286000       2.97395000 
+C        6.60455000      -1.79779000       3.72549000 
+H        6.06192000      -2.55296000       3.69458000 
+C       16.03321000       2.80059000       3.51717000 
+H       16.88295000       2.94142000       3.86834000
+        """,
+    basis={
+        "default": "def2tzvp",
+        "C": "6-31G*",
+        "H": "6-31G*",
+        "S": "6-31G*",
+        "O": "6-31G*",
+    },
+    symmetry=0,
+    spin=3,
+    charge=-2,
+    verbose=4,
+    max_memory=500000,
+)
+
+mf = scf.rohf.ROHF(mol).x2c()
+mf.max_cycle = 100
+title = "CoNSPh2"
+imp_inds = mol.search_ao_label(["Co *"])
+mf.chkfile = title + "_rohf.chk"
+mf.init_guess = "atom"
+mf.level_shift = 0.2
+if os.path.isfile(title + "_rohf.chk"):
+    mf.init_guess = "chk"
+    mf.level_shift = 0.0
+mf.kernel()
+
+print("nao = ", mol.nao_nr())
+print("nelec = ", mol.nelec)
+
+
+with open(title + "_rohf.molden", "w") as f1:
+    molden.header(mol, f1)
+    molden.orbital_coeff(mol, f1, mf.mo_coeff, ene=mf.mo_energy, occ=mf.mo_occ)
+
+
+ao_labels = ["Co 3d"]
+ncas, nelecas, mo = avas.avas(mf, ao_labels)
+assert ncas == 5
+# assert nelecas == 7
+solver = mcscf.CASSCF(mf, ncas=ncas, nelecas=nelecas)
+solver.max_cycle_micro = 100
+# mo = solver.sort_mo([130, 131, 132, 133, 134, 135, 139, 140, 142, 143])
+statelis = [0, 40, 0, 10]
+mcfs = []
+logger.info(solver, "Attempting SA-DMRGSCF with")
+for i in range(len(statelis)):
+    if statelis[i] != 0:
+        new_mcf = dmrgscf.DMRGCI(mol, maxM=1500, tol=1e-10)
+        new_mcf.spin = i
+        new_mcf.nroots = statelis[i]
+        new_mcf.threads = 32
+        new_mcf.memory = int(mol.max_memory / 1000)
+        new_mcf.block_extra_keyword = [
+            "real_density_matrix",
+            "davidson_soft_max_iter 1600",
+            "noreorder",
+            "cutoff 1E-24",
+        ]
+        new_mcf.runtimeDir = lib.param.TMPDIR + "/%d" % i
+        new_mcf.scratchDirectory = lib.param.TMPDIR + "/%d" % i
+        mcfs.append(new_mcf)
+        logger.info(solver, "%s states with spin multiplicity %s", statelis[i], i + 1)
+statetot = sum(statelis)
+mcscf.state_average_mix_(solver, mcfs, np.ones(statetot) / statetot)
+solver.kernel(mo)
+
+mc = copy.copy(solver)
+
+fcidump.from_integrals(
+    "FCIDUMP",
+    solver.get_h1eff()[0],
+    solver.get_h2eff(),
+    solver.ncas,
+    solver.nelecas,
+    nuc=solver.get_h1eff()[1],
+)
+
+mo_cas = mc.mo_coeff[:, mc.ncore : mc.ncore + mc.ncas]
+sodm1 = mc.make_rdm1()
+
+# soc integral
+# breit-pauli amfi
+soc_start = time()
+amfi = True
+hso1e = mol.intor_asymmetric("int1e_pnucxp", 3)
+vj, vk = get_bp_hso2e_amfi(mol, sodm1) if amfi else get_bp_hso2e(mol, sodm1)
+hso2e = vj - vk * 1.5
+hsoao = 1.0j * (nist.ALPHA**2 / 2) * (hso1e + hso2e)
+print("hsoao.shape = ", hsoao.shape)
+
+hso = np.asarray([reduce(np.dot, (mo_cas.T, x.T, mo_cas)) for x in hsoao])
+print("hso.shape = ", hso.shape)
+# Save each component of hso (shape: 3 x nao x nao) to separate binary files as complex128
+hso_labels = ["x", "y", "z"]
+for i, label in enumerate(hso_labels):
+    with open(f"hso_{label}.bin", "wb") as f:
+        # 先写入shape信息（int32），再写入数据（complex128）
+        shape = np.array(hso[i].shape, dtype=np.int32)
+        f.write(shape.tobytes())
+        f.write(hso[i].astype(np.complex128).tobytes())
+        # print(hso[i])
+
+soc_end = time()
+print(f"soc time = {(soc_end - soc_start):.3f} s")
+
+# np.save("sodm1.npy", sodm1)
+# # x2camf
+# from mycamf import x2camf
+
+# xmol, ctr = mf.with_x2c.get_xmol(mol)
+# xdmao = ctr @ sodm1 @ ctr.conj().T
+# print("sodm1.shape = ", sodm1.shape)
+# print("xdmao.shape = ", xdmao.shape)
+# x = mf.with_x2c.get_xmat()
+# r = mf.with_x2c._get_rmat(x=x)
+# hso1e = xmol.intor_asymmetric("int1e_pnucxp", 3)
+# hso1e = np.einsum(
+#     "pq,qr,irs,sk,kl->ipl", r.conj().T, x.conj().T, hso1e, x, r, optimize=True
+# )
+
+# hso2e = x2camf.amfi(mf.with_x2c, printLevel=1)
+
+# hso2e = hso2e / (nist.ALPHA**2 / 4)
+# sphsp = xmol.sph2spinor_coeff()
+# p_repr = np.einsum("ixp,pq,jyq->ijxy", sphsp, hso2e, sphsp.conj(), optimize=True)
+# hso2e = (p_repr[0, np.array([1, 1, 0])] * np.array([-1j, 1, -1j])[:, None, None]).real
+
+# s22 = xmol.intor_symmetric("int1e_ovlp")
+# s21 = gto.intor_cross("int1e_ovlp", xmol, mol)
+# c = cho_solve(s22, s21)
+# hso1e = c.conj().T @ hso1e @ c
+# hso2e = c.conj().T @ hso2e @ c
+# print("hso1e.shape = ", hso1e.shape)
+# print("hso2e.shape = ", hso2e.shape)
+# hsoao = (1j * nist.ALPHA**2 / 2) * (hso1e + hso2e)
+
+# hso = np.asarray([reduce(np.dot, (mo_cas.T.conj(), i.T, mo_cas)) for i in hsoao])
+# print("hso.shape = ", hso.shape)
+# # Save each component of hso (shape: 3 x nao x nao) to separate binary files as complex128
+# hso_labels = ["x", "y", "z"]
+# for i, label in enumerate(hso_labels):
+#     with open(f"hso_{label}.bin", "wb") as f:
+#         # 先写入shape信息（int32），再写入数据（complex128）
+#         shape = np.array(hso[i].shape, dtype=np.int32)
+#         f.write(shape.tobytes())
+#         f.write(hso[i].astype(np.complex128).tobytes())
+#         # print(hso[i])
+
+print(f"total time elapsed: {time() - start:.2f}s")
+#INFO: ******************** input file end ********************
+
+
+System: uname_result(system='Linux', node='cu06', release='5.15.0-133-generic', version='#144-Ubuntu SMP Fri Feb 7 20:47:38 UTC 2025', machine='x86_64')  Threads 32
+Python 3.11.13 (main, Jun  5 2025, 13:12:00) [GCC 11.2.0]
+numpy 2.3.1  scipy 1.16.0  h5py 3.14.0
+Date: Mon Jul 28 12:37:35 2025
+PySCF version 2.9.0
+PySCF path  /home/Yxwxwx/.conda/envs/pyscf_311/lib/python3.11/site-packages/pyscf
+
+[CONFIG] conf_file None
+[INPUT] verbose = 4
+[INPUT] num. atoms = 53
+[INPUT] num. electrons = 301
+[INPUT] charge = -2
+[INPUT] spin (= nelec alpha-beta = 2S) = 3
+[INPUT] symmetry 0 subgroup None
+[INPUT] Mole.unit = angstrom
+[INPUT] Symbol           X                Y                Z      unit          X                Y                Z       unit  Magmom
+[INPUT]  1 Co    11.044040000000   1.049000000000   3.343780000000 AA   20.870210908742   1.982322704669   6.318828420798 Bohr   0.0
+[INPUT]  2 S      8.778230000000   3.009360000000   4.338210000000 AA   16.588450558441   5.686866210221   8.198028770849 Bohr   0.0
+[INPUT]  3 S     11.436220000000   3.021510000000   0.927300000000 AA   21.611323700273   5.709826382635   1.752343035309 Bohr   0.0
+[INPUT]  4 S     10.911080000000  -2.028780000000   2.572310000000 AA   20.618952923219  -3.833838566995   4.860961407480 Bohr   0.0
+[INPUT]  5 S     13.086350000000   0.195190000000   5.607710000000 AA   24.729617470202   0.368855642254  10.597036085985 Bohr   0.0
+[INPUT]  6 O     11.831670000000  -0.457680000000   5.965830000000 AA   22.358615896233  -0.864889852691  11.273784805714 Bohr   0.0
+[INPUT]  7 O     12.190190000000   3.072830000000  -0.307090000000 AA   23.036120506412   5.806807127347  -0.580315995593 Bohr   0.0
+[INPUT]  8 O      7.932630000000   3.087380000000   5.514620000000 AA   14.990498147509   5.834302642460  10.421121481049 Bohr   0.0
+[INPUT]  9 O     10.078600000000   2.538580000000   0.821770000000 AA   19.045793719041   4.797220945298   1.552920237384 Bohr   0.0
+[INPUT] 10 N     10.129890000000  -0.709780000000   2.995720000000 AA   19.142717771970  -1.341289808694   5.661090345882 Bohr   0.0
+[INPUT] 11 O     13.745290000000   0.856690000000   6.719380000000 AA   25.974833602723   1.618909473654  12.697787926880 Bohr   0.0
+[INPUT] 12 O     10.274270000000  -2.765100000000   1.496670000000 AA   19.415556429835  -5.225281707035   2.828296398853 Bohr   0.0
+[INPUT] 13 O     10.002040000000   3.777010000000   4.382100000000 AA   18.901116286945   7.137514469743   8.280968850457 Bohr   0.0
+[INPUT] 14 O     12.279510000000  -1.599560000000   2.301250000000 AA   23.204910843858  -3.022730319809   4.348732244155 Bohr   0.0
+[INPUT] 15 N     12.763690000000   1.147470000000   4.380640000000 AA   24.119878438850   2.168404036155   8.278209850315 Bohr   0.0
+[INPUT] 16 N      9.203590000000   1.512600000000   3.968930000000 AA   17.392264462786   2.858399736017   7.500190707570 Bohr   0.0
+[INPUT] 17 N     12.132220000000   2.149160000000   2.069880000000 AA   22.926573082971   4.061323797870   3.911506310715 Bohr   0.0
+[INPUT] 18 C      6.102750000000  -0.600270000000   4.185850000000 AA   11.532526106689  -1.134345900793   7.910110098511 Bohr   0.0
+[INPUT] 19 H      5.209990000000  -0.543520000000   4.440810000000 AA    9.845454211723  -1.027103943224   8.391914671230 Bohr   0.0
+[INPUT] 20 C     13.461880000000   2.406050000000   2.476830000000 AA   25.439266321760   4.546775542010   4.680530357106 Bohr   0.0
+[INPUT] 21 C      8.768880000000  -0.757900000000   3.381090000000 AA   16.570781619176  -1.432223429808   6.389334102506 Bohr   0.0
+[INPUT] 22 C      7.812800000000   3.620670000000   2.987120000000 AA   14.764052266002   6.842074687429   5.644838701211 Bohr   0.0
+[INPUT] 23 H      6.989190000000   3.130060000000   2.933720000000 AA   13.207654932549   5.914956153456   5.543927326159 Bohr   0.0
+[INPUT] 24 H      8.302930000000   3.513720000000   2.169190000000 AA   15.690263731435   6.639968478407   4.099175012145 Bohr   0.0
+[INPUT] 25 H      7.622360000000   4.551210000000   3.125760000000 AA   14.404172822840   8.600540435382   5.906830331120 Bohr   0.0
+[INPUT] 26 C     14.427920000000   3.121750000000   1.755660000000 AA   27.264817347135   5.899252529361   3.317716567854 Bohr   0.0
+[INPUT] 27 H     14.215360000000   3.465760000000   0.918160000000 AA   26.863137162097   6.549337213473   1.735070938531 Bohr   0.0
+[INPUT] 28 C     13.810060000000   1.853100000000   3.735180000000 AA   26.097231163811   3.501851481432   7.058467225953 Bohr   0.0
+[INPUT] 29 C     11.003810000000  -3.088820000000   3.983560000000 AA   20.794187226750  -5.837023848079   7.527837400772 Bohr   0.0
+[INPUT] 30 H     11.425040000000  -2.620110000000   4.707850000000 AA   21.590196562201  -4.951290316234   8.896547135534 Bohr   0.0
+[INPUT] 31 H     11.518610000000  -3.868610000000   3.764080000000 AA   21.767018235676  -7.310613382754   7.113080310953 Bohr   0.0
+[INPUT] 32 H     10.118590000000  -3.352260000000   4.243280000000 AA   19.121363866763  -6.334853298334   8.018637069844 Bohr   0.0
+[INPUT] 33 C     11.350660000000   4.677500000000   1.548070000000 AA   21.449638733056   8.839193947653   2.925428321655 Bohr   0.0
+[INPUT] 34 H     10.855060000000   4.685500000000   2.370380000000 AA   20.513090465721   8.854311756650   4.479369011147 Bohr   0.0
+[INPUT] 35 H     10.910960000000   5.238610000000   0.903530000000 AA   20.618726156084   9.899538173408   1.707424245328 Bohr   0.0
+[INPUT] 36 H     12.238070000000   5.006810000000   1.706460000000 AA   23.126600593256   9.461499657734   3.224742042525 Bohr   0.0
+[INPUT] 37 C     15.091470000000   2.062510000000   4.237610000000 AA   28.518745117090   3.897579029177   8.007922322718 Bohr   0.0
+[INPUT] 38 H     15.323720000000   1.705710000000   5.064500000000 AA   28.957634009520   3.223324747932   9.570517957860 Bohr   0.0
+[INPUT] 39 C     15.701430000000   3.322690000000   2.280210000000 AA   29.671402464030   6.278974096831   4.308972406494 Bohr   0.0
+[INPUT] 40 H     16.329990000000   3.809460000000   1.797910000000 AA   30.859208716886   7.198836082486   3.397557496617 Bohr   0.0
+[INPUT] 41 C      6.915660000000   0.527700000000   4.273820000000 AA   13.068703370610   0.997208475933   8.076349305689 Bohr   0.0
+[INPUT] 42 H      6.561400000000   1.326840000000   4.590790000000 AA   12.399248993721   2.507364211118   8.675335795392 Bohr   0.0
+[INPUT] 43 C     14.178660000000  -1.054600000000   5.000850000000 AA   26.793784213326  -1.992905170966   9.450236890031 Bohr   0.0
+[INPUT] 44 H     13.766920000000  -1.507480000000   4.261570000000 AA   26.015708378797  -2.848724338259   8.053200160663 Bohr   0.0
+[INPUT] 45 H     14.363630000000  -1.684920000000   5.700990000000 AA   27.143326854586  -3.184037341802  10.773309738884 Bohr   0.0
+[INPUT] 46 H     14.999230000000  -0.649030000000   4.709680000000 AA   28.344436779360  -1.226488946626   8.900005334342 Bohr   0.0
+[INPUT] 47 C      8.260270000000   0.468710000000   3.888090000000 AA   15.609648014961   0.885733531845   7.347425247660 Bohr   0.0
+[INPUT] 48 C      7.934810000000  -1.870200000000   3.306650000000 AA   14.994617750460  -3.534165798162   6.248662889793 Bohr   0.0
+[INPUT] 49 H      8.267690000000  -2.672860000000   2.973950000000 AA   15.623669782805  -5.050973369305   5.619951008150 Bohr   0.0
+[INPUT] 50 C      6.604550000000  -1.797790000000   3.725490000000 AA   12.480790675996  -3.397330729482   7.040155779806 Bohr   0.0
+[INPUT] 51 H      6.061920000000  -2.552960000000   3.694580000000 AA   11.455368589023  -4.824395206970   6.981744345296 Bohr   0.0
+[INPUT] 52 C     16.033210000000   2.800590000000   3.517170000000 AA   30.298375797638   5.292348087196   6.646488033536 Bohr   0.0
+[INPUT] 53 H     16.882950000000   2.941420000000   3.868340000000 AA   31.904151674726   5.558478217318   7.310103156700 Bohr   0.0
+
+nuclear repulsion = 5792.68230398633
+number of shells = 275
+number of NR pGTOs = 1208
+number of NR cGTOs = 617
+basis = {'default': 'def2tzvp', 'C': '6-31G*', 'H': '6-31G*', 'S': '6-31G*', 'O': '6-31G*'}
+ecp = {}
+CPU time:         5.72
+
+
+******** <class 'pyscf.x2c.sfx2c1e.sfX2C1eROHF'> ********
+method = sfX2C1eROHF
+initial guess = chk
+damping factor = 0
+level_shift factor = 0.0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 100
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = CoNSPh2_rohf.chk
+max_memory 500000 MB (current use 100 MB)
+num. doubly occ = 149  num. singly occ = 3
+
+
+******** <class 'pyscf.x2c.sfx2c1e.SpinFreeX2CHelper'> ********
+approx = 1e
+xuncontract = 1
+Set gradient conv threshold to 3.16228e-05
+init E= -4418.46313158888
+  HOMO = 0.141593444510231  LUMO = 0.347708999194862
+cycle= 1 E= -4418.46313158888  delta_E= -1.82e-12  |g|= 2.11e-06  |ddm|= 5.09e-06
+  HOMO = 0.141593387219268  LUMO = 0.347708993242263
+Extra cycle  E= -4418.46313158889  delta_E= -7.28e-12  |g|= 3.19e-06  |ddm|= 8.43e-06
+converged SCF energy = -4418.46313158889
+nao =  617
+nelec =  (152, 149)
+
+******** AVAS flags ********
+aolabels = ['Co 3d']
+ncore = 0
+minao = minao
+threshold = 0.2
+with_iao = False
+openshell_option = 2
+canonicalize = True
+
+** AVAS **
+  Total number of HF MOs  is equal to    617
+  Number of occupied HF MOs is equal to  152
+reference AO indices for minao ['Co 3d']:
+ [10 11 12 13 14]
+Option 2: threshold 0.2
+Active from occupied = 5 , eig [0.99592708 0.9963824  0.99644477 0.99735806 0.99842212]
+Inactive from occupied = 147
+Active from unoccupied = 0 , eig []
+Inactive from unoccupied = 465
+Dimensions of active 5
+# of alpha electrons 5
+# of beta electrons 2
+Attempting SA-DMRGSCF with
+40 states with spin multiplicity 2
+10 states with spin multiplicity 4
+
+******** <class 'pyscf.mcscf.addons.StateAverageCASSCF'> ********
+CAS (5e+2e, 5o), ncore = 147, nvir = 465
+max_cycle_macro = 50
+max_cycle_micro = 100
+conv_tol = 1e-07
+conv_tol_grad = None
+orbital rotation max_stepsize = 0.02
+orbital rotation threshold for CI restart = 0.01
+augmented hessian ah_max_cycle = 30
+augmented hessian ah_conv_tol = 1e-12
+augmented hessian ah_linear dependence = 1e-14
+augmented hessian ah_level shift = 1e-08
+augmented hessian ah_start_tol = 2.5
+augmented hessian ah_start_cycle = 3
+augmented hessian ah_grad_trust_region = 3
+kf_trust_region = 3
+kf_interval = 4
+ci_response_space = 4
+ci_grad_trust_region = 3
+with_dep4 0
+natorb = False
+canonicalization = True
+sorting_mo_energy = False
+ao2mo_level = 2
+chkfile = CoNSPh2_rohf.chk
+max_memory 500000 MB (current use 145977 MB)
+internal_rotation = False
+
+******** Block flags ********
+executable             = /home/Yxwxwx/.conda/envs/pyscf_311/bin/block2main
+BLOCKEXE_COMPRESS_NEVPT= /path/to/serially/compiled/Block/block.spin_adapted
+Block version          = 2.0
+mpiprefix              =  
+scratchDirectory       = /tmp/1
+integralFile           = /tmp/1/FCIDUMP
+configFile             = /tmp/1/dmrg.conf
+outputFile             = /tmp/1/dmrg.out
+maxIter                = 38
+scheduleSweeps         = [0, 4, 8, 12, 14, 16, 18, 20, 22, 24, 26]
+scheduleMaxMs          = [200, 400, 800, 1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500]
+scheduleTols           = [0.0001, 0.0001, 0.0001, 0.0001, 1e-05, 1.0000000000000002e-06, 1.0000000000000002e-07, 1.0000000000000002e-08, 1.0000000000000003e-09, 1.0000000000000003e-10, 1.0000000000000001e-11]
+scheduleNoises         = [0.0001, 0.0001, 0.0001, 0.0001, 1e-05, 1.0000000000000002e-06, 1.0000000000000002e-07, 1.0000000000000002e-08, 1.0000000000000003e-09, 1.0000000000000003e-10, 0.0]
+twodot_to_onedot       = 30
+tol                    = 1e-10
+maxM                   = 1500
+dmrg switch tol        = 0.001
+wfnsym                 = 1
+fullrestart            = False
+num_thrds              = 32
+memory                 = 500
+
+State-average over 50 states with weights [0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02
+ 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02
+ 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02
+ 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02]
+CASCI E = -4418.18808074919  S^2 = 1.3500000
+Set conv_tol_grad to 0.000316228
+macro iter   1 ( 43 JK   14 micro), CASSCF E = -4418.31702522881  dE = -1.28944480e-01  S^2 = 1.3500000
+               |grad[o]|=0.395  |ddm|=2.54e-15  |maxRot[o]|= 0.19
+macro iter   2 ( 13 JK    5 micro), CASSCF E = -4418.32034413822  dE = -3.31890941e-03  S^2 = 1.3500000
+               |grad[o]|=0.0486  |ddm|=3.08e-15  |maxRot[o]|=0.0348
+macro iter   3 (  7 JK    3 micro), CASSCF E = -4418.32035034621  dE = -6.20799074e-06  S^2 = 1.3500000
+               |grad[o]|=0.00176  |ddm|=3.39e-15  |maxRot[o]|=0.00163
+macro iter   4 (  1 JK    1 micro), CASSCF E = -4418.32035034621  dE =  0.00000000e+00  S^2 = 1.3500000
+               |grad[o]|=2.24e-05  |ddm|=1.74e-15  |maxRot[o]|=    0
+1-step CASSCF converged in   4 macro ( 64 JK  23 micro) steps
+CASSCF canonicalization
+Density matrix diagonal elements [1.4 1.4 1.4 1.4 1.4]
+CASSCF energy = -4418.32035034621
+CASCI E = -4418.32035034621  E(CI) = -20.2773122011022  S^2 = 1.3500000
+CASCI state-averaged energy = -4418.32035034621
+CASCI energy for each state
+  State 0 weight 0.02  E = -4418.3802203422 S^2 = 0.7500000
+  State 1 weight 0.02  E = -4418.37505931083 S^2 = 0.7500000
+  State 2 weight 0.02  E = -4418.37349089614 S^2 = 0.7500000
+  State 3 weight 0.02  E = -4418.37245500502 S^2 = 0.7500000
+  State 4 weight 0.02  E = -4418.37148024294 S^2 = 0.7500000
+  State 5 weight 0.02  E = -4418.36784212967 S^2 = 0.7500000
+  State 6 weight 0.02  E = -4418.3665284269 S^2 = 0.7500000
+  State 7 weight 0.02  E = -4418.35261426916 S^2 = 0.7500000
+  State 8 weight 0.02  E = -4418.35151472582 S^2 = 0.7500000
+  State 9 weight 0.02  E = -4418.35095707353 S^2 = 0.7500000
+  State 10 weight 0.02  E = -4418.3437337541 S^2 = 0.7500000
+  State 11 weight 0.02  E = -4418.34273124028 S^2 = 0.7500000
+  State 12 weight 0.02  E = -4418.34064467557 S^2 = 0.7500000
+  State 13 weight 0.02  E = -4418.33997868851 S^2 = 0.7500000
+  State 14 weight 0.02  E = -4418.32777127329 S^2 = 0.7500000
+  State 15 weight 0.02  E = -4418.32686007779 S^2 = 0.7500000
+  State 16 weight 0.02  E = -4418.32590798473 S^2 = 0.7500000
+  State 17 weight 0.02  E = -4418.32416743458 S^2 = 0.7500000
+  State 18 weight 0.02  E = -4418.32265046654 S^2 = 0.7500000
+  State 19 weight 0.02  E = -4418.32208360372 S^2 = 0.7500000
+  State 20 weight 0.02  E = -4418.32194588785 S^2 = 0.7500000
+  State 21 weight 0.02  E = -4418.31674170401 S^2 = 0.7500000
+  State 22 weight 0.02  E = -4418.3136651806 S^2 = 0.7500000
+  State 23 weight 0.02  E = -4418.30816917888 S^2 = 0.7500000
+  State 24 weight 0.02  E = -4418.3042434605 S^2 = 0.7500000
+  State 25 weight 0.02  E = -4418.30369005845 S^2 = 0.7500000
+  State 26 weight 0.02  E = -4418.30299553273 S^2 = 0.7500000
+  State 27 weight 0.02  E = -4418.30116244865 S^2 = 0.7500000
+  State 28 weight 0.02  E = -4418.25677546309 S^2 = 0.7500000
+  State 29 weight 0.02  E = -4418.25545584351 S^2 = 0.7500000
+  State 30 weight 0.02  E = -4418.2504930979 S^2 = 0.7500000
+  State 31 weight 0.02  E = -4418.2485626008 S^2 = 0.7500000
+  State 32 weight 0.02  E = -4418.24418963002 S^2 = 0.7500000
+  State 33 weight 0.02  E = -4418.24409729926 S^2 = 0.7500000
+  State 34 weight 0.02  E = -4418.23975176438 S^2 = 0.7500000
+  State 35 weight 0.02  E = -4418.15235162428 S^2 = 0.7500000
+  State 36 weight 0.02  E = -4418.14444359067 S^2 = 0.7500000
+  State 37 weight 0.02  E = -4418.14216168537 S^2 = 0.7500000
+  State 38 weight 0.02  E = -4418.12864430986 S^2 = 0.7500000
+  State 39 weight 0.02  E = -4418.12698889091 S^2 = 0.7500000
+  State 40 weight 0.02  E = -4418.46088809492 S^2 = 3.7500000
+  State 41 weight 0.02  E = -4418.4583137654 S^2 = 3.7500000
+  State 42 weight 0.02  E = -4418.43710643883 S^2 = 3.7500000
+  State 43 weight 0.02  E = -4418.43318541211 S^2 = 3.7500000
+  State 44 weight 0.02  E = -4418.42843983343 S^2 = 3.7500000
+  State 45 weight 0.02  E = -4418.42777486441 S^2 = 3.7500000
+  State 46 weight 0.02  E = -4418.42292811231 S^2 = 3.7500000
+  State 47 weight 0.02  E = -4418.35894247678 S^2 = 3.7500000
+  State 48 weight 0.02  E = -4418.3536402235 S^2 = 3.7500000
+  State 49 weight 0.02  E = -4418.35107721583 S^2 = 3.7500000
+hsoao.shape =  (3, 617, 617)
+hso.shape =  (3, 5, 5)
+soc time = 5.452 s
+total time elapsed: 2850.05s
