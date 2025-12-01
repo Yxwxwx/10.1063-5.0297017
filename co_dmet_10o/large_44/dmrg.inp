@@ -1,0 +1,17 @@
+[dmrgscf]
+ CI_only
+ independent
+ SOC
+ symm = su2u1
+ docc = 0
+ frozen = 0
+ mixture = 1 3 
+ nstate_mix = 40 10
+ pg = c1
+ integral = FCIDUMP
+ nactel = 7
+ active = 10
+ 2S = 3
+ M = 2000
+ tol_E = 0
+ schedule_dav = 0.0001 0.0001 0.0001 1e-06 1e-06 1e-10 1e-10 1e-10 1e-10 1e-10 1e-10 1e-10 1e-10 1e-10
